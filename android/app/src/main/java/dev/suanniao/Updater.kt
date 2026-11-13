@@ -57,6 +57,8 @@ import kotlin.math.roundToLong
  * - 国内连 GitHub 慢：latest.json 先读 Gitee 上的，读不到再读 GitHub 的；安装包也先从 Gitee 下（那边单个附件最多
  *   100 MB，拆成了几份 parts，按顺序接起来），下不成再从 GitHub 接着下。不管从哪下，都按下面的办法核对；
  *   Gitee 上的东西就算被人换了，签名对不上也装不上（系统也会拒绝）
+ * - 看哪个仓库见 UpdateSource：自己打的开发版（编译时 -PupdateRepo）只读那个仓库在 GitHub 上的 latest.json，
+ *   不碰作者的 Gitee 镜像；那个仓库还没发过版本（404）就安静地当成「已是最新」
  * - 打开 App 时自己看一眼（离上次超过 6 小时；⋯ 菜单里能关），⋯ 菜单里「检查更新」随时看
  * - 自己查到的新版本：没开着别的面板、教程，没在调整布局、没在说话，手也离开屏幕一会儿了才弹。
  *   「以后再说」一天内不再弹，「跳过这个版本」这一版不再弹（菜单里查照样显示）
@@ -137,7 +139,9 @@ class Updater(private val host: Host, private val overlays: Overlays) {
     private class Ready(val info: Info, val file: File)
 
     /** 说给用户听的失败原因 */
-    private class Failure(override val message: String) : Exception(message)
+    private open class Failure(override val message: String) : Exception(message)
+    /** 发布页上没有 latest.json（404）：那个仓库还没发过版本 */
+    private class NoRelease : Failure("发布页上还没有更新信息")
     /** 签名和装着的对不上：覆盖装不上 */
     private class Conflict : Exception()
     private class Cancelled : Exception()
@@ -343,16 +347,20 @@ class Updater(private val host: Host, private val overlays: Overlays) {
         val gen = ++checkGen
         main.removeCallbacks(autoTask)
         host.onUpdateChanged()
-        // 先读 Gitee 的（国内快），读不到再读 GitHub 的；都没读到时说 GitHub 那边的原因
-        val urls = debugUrl?.let { listOf(it) } ?: listOf(GITEE_MANIFEST_URL, MANIFEST_URL)
+        // 先读 Gitee 的（国内快），读不到再读 GitHub 的；都没读到时说 GitHub 那边的原因。
+        // 开发版看自己的仓库（编译时 -PupdateRepo）：只读那个仓库在 GitHub 上的
+        val urls = debugUrl?.let { listOf(it) } ?: UpdateSource.manifestUrls(UpdateSource.repo)
         val test = debugUrl != null
+        val ownRepo = debugUrl == null && UpdateSource.custom(UpdateSource.repo)
         thread(name = "update-check", isDaemon = true) {
             var result = Result.failure<Info>(IOException())
             for (url in urls) {
                 result = runCatching { fetchManifest(url, test) }
                 if (result.isSuccess) break
             }
-            val why = result.exceptionOrNull()?.let(::checkReason)
+            // 自己的仓库还没发过版本（404）：安静地当成「已是最新」，不报错
+            val unreleased = ownRepo && result.exceptionOrNull() is NoRelease
+            val why = if (unreleased) null else result.exceptionOrNull()?.let(::checkReason)
             main.post { if (gen == checkGen) checked(result.getOrNull(), why) }
         }
     }
@@ -1008,7 +1016,7 @@ class Updater(private val host: Host, private val overlays: Overlays) {
         try {
             when (val code = c.responseCode) {
                 HttpURLConnection.HTTP_OK -> {}
-                HttpURLConnection.HTTP_NOT_FOUND -> throw Failure("发布页上还没有更新信息")
+                HttpURLConnection.HTTP_NOT_FOUND -> throw NoRelease()
                 else -> throw Failure("服务器返回 $code")
             }
             val bytes = c.inputStream.use { readAtMost(it, MAX_MANIFEST) } ?: throw Failure("更新信息太大，读不懂")
@@ -1075,6 +1083,7 @@ class Updater(private val host: Host, private val overlays: Overlays) {
         e is MalformedURLException -> "更新信息里的地址不对"
         offline() -> "没联网"
         e is SocketTimeoutException -> "连发布页超时"
+        UpdateSource.custom(UpdateSource.repo) -> "连不上发布页（GitHub）"
         else -> "连不上发布页（GitHub 和国内的 Gitee 都试过了）"
     }
 
@@ -1175,14 +1184,10 @@ class Updater(private val host: Host, private val overlays: Overlays) {
         private const val KEY_UPDATE_RESUME = "update_resume_install"
         private const val RESUME_MS = 30 * 60_000L
 
-        /** 最新一版的更新信息：GitHub 先跳到那一版的发布，再跳到放文件的地址 */
-        private const val MANIFEST_URL = "https://github.com/drhhhao/SuanNIAO/releases/latest/download/latest.json"
-        /** Gitee 上最新一版的更新信息（Gitee 的 latest 指最新建的发行版；国内快，先读这个） */
-        private const val GITEE_MANIFEST_URL = "https://gitee.com/drhhhao_0/SuanNIAO/releases/download/latest/latest.json"
-        /** latest.json 里的 mirror 只认这个开头的（调试版另外认本机的 http，测试用） */
+        /** latest.json 里的 mirror 只认这个开头的（调试版另外认本机的 http，测试用）；看自己仓库的开发版不用作者的镜像 */
         private const val MIRROR_PREFIX = "https://gitee.com/drhhhao_0/SuanNIAO/releases/download/"
         /** 更新信息里没写发布页（或写的不是 GitHub）时，「去网页下载」打开这里 */
-        private const val RELEASES_PAGE = "https://github.com/drhhhao/SuanNIAO/releases/latest"
+        private val RELEASES_PAGE = UpdateSource.releasesPage(UpdateSource.repo)
         /** 认得的 latest.json 格式，比它新的读不懂 */
         private const val SCHEMA = 1
         private const val CHECK_EVERY_MS = 6 * 3600_000L
@@ -1256,9 +1261,11 @@ class Updater(private val host: Host, private val overlays: Overlays) {
             }.orEmpty()
             val page = j.str("page").takeIf { it.startsWith("https://github.com/") } ?: RELEASES_PAGE
             val file = a.str("file").takeIf { FILE_NAME.matches(it) } ?: "SuanNIAO-Android-$version.apk"
-            // Gitee 上的下载地址和拆开的几份：地址不对、几份加起来不是整个安装包的大小，就当没有，只从 GitHub 下
+            // Gitee 上的下载地址和拆开的几份：地址不对、几份加起来不是整个安装包的大小，就当没有，只从 GitHub 下。
+            // 看自己仓库的开发版不认作者的镜像（那里放的是作者的安装包）
             val mirror = j.str("mirror").takeIf {
-                it.endsWith("/") && (it.startsWith(MIRROR_PREFIX) || (BuildConfig.DEBUG && it.startsWith("http://127.0.0.1")))
+                it.endsWith("/") && ((it.startsWith(MIRROR_PREFIX) && !UpdateSource.custom(UpdateSource.repo)) ||
+                    (BuildConfig.DEBUG && it.startsWith("http://127.0.0.1")))
             }
             val parts = a.optJSONArray("parts")?.let { arr ->
                 (0 until arr.length()).map { i ->
@@ -1302,6 +1309,33 @@ class Updater(private val host: Host, private val overlays: Overlays) {
             attached?.downloadDone(d, file != null)
         }
     }
+}
+
+/**
+ * 检查更新看哪个 GitHub 仓库：编译时 -PupdateRepo 指定（BuildConfig.UPDATE_REPO），没指定是作者的 drhhhao/SuanNIAO。
+ * - 作者的仓库：先读 Gitee 镜像上的 latest.json（国内快），读不到再读 GitHub 的；
+ * - 别的仓库（自己打的开发版，比如 someone/SuanNIAO）：只读它在 GitHub 上的，不碰作者的 Gitee 镜像，
+ *   开发版就不会提示更新成作者发的正式版。
+ */
+internal object UpdateSource {
+    const val DEFAULT_REPO = "drhhhao/SuanNIAO"
+    /** Gitee 上最新一版的更新信息（Gitee 的 latest 指最新建的发行版；国内快，先读这个）。只有作者的仓库有 */
+    const val GITEE_MANIFEST_URL = "https://gitee.com/drhhhao_0/SuanNIAO/releases/download/latest/latest.json"
+
+    /** 这个安装包编译时定的仓库 */
+    val repo: String get() = BuildConfig.UPDATE_REPO
+
+    /** 不是作者的仓库 */
+    fun custom(repo: String) = repo != DEFAULT_REPO
+
+    /** 最新一版的更新信息：GitHub 先跳到那一版的发布，再跳到放文件的地址 */
+    fun githubManifest(repo: String) = "https://github.com/$repo/releases/latest/download/latest.json"
+
+    fun releasesPage(repo: String) = "https://github.com/$repo/releases/latest"
+
+    /** 按顺序读 latest.json，读到一个就行 */
+    fun manifestUrls(repo: String): List<String> =
+        if (custom(repo)) listOf(githubManifest(repo)) else listOf(GITEE_MANIFEST_URL, githubManifest(repo))
 }
 
 /**

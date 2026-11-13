@@ -11,12 +11,14 @@
 pub mod actions;
 pub mod axonkey;
 pub mod geometry;
+pub mod key_editor;
 pub mod leveldb;
 pub mod merge;
 pub mod presets;
 pub mod profiles;
 pub mod sequence;
 pub mod transfer;
+pub mod workbench;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +37,27 @@ pub use profiles::{clean_profile_name, ButtonMapping, Profile, SavedSequence, PR
 /// 配置文件格式的版本：2 = 每步动作带 id、enabled，按键有「按住时」，有总开关；3 = 多套方案、已保存的动作序列；
 /// 4 = 默认的方案改叫「默认方案」（读到 3 及以前的「默认配置」时改名）
 pub const CONFIG_VERSION: u32 = 4;
+
+/// 配置顶层记「发过的最大 id 编号」的键（数字，见 Config::new_id）。正式版看不懂，放在 extra 里原样留着
+pub const ID_HIGH_WATER: &str = "idHighWater";
+
+/// id 末尾「-编号」的编号（button-7 → 7）；没有、或者大得离谱（不是 new_id 发的）返回 None
+fn id_number(id: &str) -> Option<u64> {
+    let (_, tail) = id.rsplit_once('-')?;
+    if tail.is_empty() || tail.len() > 9 || !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    tail.parse().ok()
+}
+
+/// idHighWater 的值；没写、写坏了是 0（小数照样认；负数、大得离谱的（手改坏了，加一会溢出）当 0，从现有 id 往后数）
+fn high_water_of(value: Option<&Value>) -> u64 {
+    let n = match value {
+        Some(v) => v.as_u64().or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0 && *f < 1e12).map(|f| f as u64)),
+        None => None,
+    };
+    n.filter(|n| *n < 1_000_000_000_000).unwrap_or(0)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -76,10 +99,11 @@ pub enum ModuleKind {
     Touchpad,
     Voice,
     VoiceButton,
+    Screen,
 }
 
 impl ModuleKind {
-    pub const ALL: [ModuleKind; 4] = [ModuleKind::Button, ModuleKind::Touchpad, ModuleKind::Voice, ModuleKind::VoiceButton];
+    pub const ALL: [ModuleKind; 5] = [ModuleKind::Button, ModuleKind::Touchpad, ModuleKind::Voice, ModuleKind::VoiceButton, ModuleKind::Screen];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -87,6 +111,7 @@ impl ModuleKind {
             ModuleKind::Touchpad => "触控板",
             ModuleKind::Voice => "语音输入框",
             ModuleKind::VoiceButton => "语音按钮",
+            ModuleKind::Screen => "电脑屏幕",
         }
     }
 
@@ -96,27 +121,24 @@ impl ModuleKind {
             ModuleKind::Touchpad => "touchpad",
             ModuleKind::Voice => "voice",
             ModuleKind::VoiceButton => "voiceButton",
+            ModuleKind::Screen => "screen",
         }
     }
 }
 
+/// 读写文件都经过 ModuleFile：电脑屏幕模块在文件里换个写法，见下面
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(from = "ModuleFile", into = "ModuleFile")]
 pub struct Module {
     pub id: String,
     pub kind: ModuleKind,
     pub label: String,
     /// 位置和大小，单位是格，可以是小数；整数写进文件时不带小数点
-    #[serde(serialize_with = "cells")]
     pub x: f64,
-    #[serde(serialize_with = "cells")]
     pub y: f64,
-    #[serde(serialize_with = "cells")]
     pub w: f64,
-    #[serde(serialize_with = "cells")]
     pub h: f64,
     /// 只有按键用：按住时怎么办（见 HoldMode）。没选过是 None：单击只有一个滚轮或光标移动时连发，其余触发一次长按
-    #[serde(deserialize_with = "lenient_hold", skip_serializing_if = "Option::is_none")]
     pub hold: Option<HoldMode>,
     /// 旧版（电脑 0.3.0、手机 0.5.0）的「按住连发」：读到 true 当作 hold = repeatClick；
     /// 保存时跟着 hold 写，旧版读到也还是连发
@@ -124,8 +146,64 @@ pub struct Module {
     /// 只有按键用：单击 / 双击 / 长按各自的动作。
     pub behaviors: Behaviors,
     /// 更新的版本加的字段：原样留着
-    #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// 电脑屏幕模块在文件里写成触控板，多带这个字段（放在模块的「看不懂也原样留着」的字段里）
+const SCREEN_FLAG: &str = "screen";
+
+/// 模块在配置文件里的样子。正式版（0.7.22）的模块类型只认按键、触控板、语音输入框、语音按钮，
+/// 读到 "kind": "screen" 会把整份配置当成坏文件、退回备份（用户的布局因此消失过）。
+/// 所以电脑屏幕写成 "kind": "touchpad" 加 "screen": true：正式版读到的是一块触控板，别的布局都在。
+/// 读的时候这种写法和旧开发版写的 "kind": "screen" 都认成电脑屏幕，内存里不留 screen 这个字段。
+/// 发给手机的（phone_payload）照旧是 "screen"
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ModuleFile {
+    id: String,
+    kind: ModuleKind,
+    label: String,
+    #[serde(serialize_with = "cells")]
+    x: f64,
+    #[serde(serialize_with = "cells")]
+    y: f64,
+    #[serde(serialize_with = "cells")]
+    w: f64,
+    #[serde(serialize_with = "cells")]
+    h: f64,
+    #[serde(deserialize_with = "lenient_hold", skip_serializing_if = "Option::is_none")]
+    hold: Option<HoldMode>,
+    repeat: bool,
+    behaviors: Behaviors,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl From<ModuleFile> for Module {
+    fn from(file: ModuleFile) -> Self {
+        let ModuleFile { id, kind, label, x, y, w, h, hold, repeat, behaviors, mut extra } = file;
+        let kind = match kind {
+            ModuleKind::Touchpad if extra.get(SCREEN_FLAG) == Some(&Value::Bool(true)) => ModuleKind::Screen,
+            kind => kind,
+        };
+        if kind == ModuleKind::Screen {
+            extra.remove(SCREEN_FLAG);
+        }
+        Module { id, kind, label, x, y, w, h, hold, repeat, behaviors, extra }
+    }
+}
+
+impl From<Module> for ModuleFile {
+    fn from(module: Module) -> Self {
+        let Module { id, kind, label, x, y, w, h, hold, repeat, behaviors, mut extra } = module;
+        let kind = if kind == ModuleKind::Screen {
+            extra.insert(SCREEN_FLAG.into(), Value::Bool(true));
+            ModuleKind::Touchpad
+        } else {
+            kind
+        };
+        ModuleFile { id, kind, label, x, y, w, h, hold, repeat, behaviors, extra }
+    }
 }
 
 /// 按住按键时怎么办
@@ -591,7 +669,16 @@ impl Config {
     }
 
     /// 在第 page 页找一块能放下 w×h 的空位（按 1/4 格从上到下、从左到右找）。
+    /// 工作台专用页（见 workbench::is_storage_page）一律返回 None：「添加按键」不能放进用户看不见的那一页
     pub fn free_spot(&self, page: usize, w: f64, h: f64) -> Option<(f64, f64)> {
+        if self.layout.pages.get(page).is_some_and(workbench::is_storage_page) {
+            return None;
+        }
+        self.free_spot_in(page, w, h)
+    }
+
+    /// 同 free_spot，但专用页也找：明确要建在哪一页的时候用（工作台的热键、快捷发送就是建在专用页上）
+    pub(crate) fn free_spot_in(&self, page: usize, w: f64, h: f64) -> Option<(f64, f64)> {
         let (columns, rows) = self.grid();
         let steps = |total: f64, size: f64| ((total - size) / SNAP + 1e-6).floor() as i64;
         (0..=steps(rows, h))
@@ -638,10 +725,43 @@ impl Config {
         strip(self) == strip(other)
     }
 
-    /// 生成不重复的模块 id。
-    pub fn new_id(&self, prefix: &str) -> String {
-        let used: Vec<&str> = self.layout.pages.iter().flat_map(|p| p.modules.iter()).map(|m| m.id.as_str()).chain(self.layout.pages.iter().map(|p| p.id.as_str())).collect();
-        (1..).map(|n| format!("{prefix}-{n}")).find(|id| !used.contains(&id.as_str())).unwrap()
+    /// 生成新的模块、页面 id（「前缀-编号」），编号只增不减，并记进 idHighWater。
+    /// 以前用的是「最小的空号」：刚删掉的按键 id 下一次新建马上又用上，工作台、方案、统计里指着旧按键的
+    /// 就悄悄指到了新按键上。现在编号 = max(记下的最大编号, 现有 id 里最大的编号) + 1，删掉的 id 不会再发出去
+    pub fn new_id(&mut self, prefix: &str) -> String {
+        let (id, n) = self.peek_id(prefix);
+        self.extra.insert(ID_HIGH_WATER.into(), json!(n));
+        id
+    }
+
+    /// 下一次 new_id 会发的 id，但不记下（手里只有只读配置的地方用，比如导入遥控器映射时先做好新的一页；
+    /// 这一页真加进配置时由 add_page_as_profile 记下）
+    pub fn next_id(&self, prefix: &str) -> String {
+        self.peek_id(prefix).0
+    }
+
+    /// 记下这个 id 的编号已经用过（不是 new_id 发出来的 id 加进配置时调）
+    pub(crate) fn note_id(&mut self, id: &str) {
+        if let Some(n) = id_number(id).filter(|n| *n > self.high_water()) {
+            self.extra.insert(ID_HIGH_WATER.into(), json!(n));
+        }
+    }
+
+    /// 记下的最大编号；没有（旧配置、正式版写的）是 0
+    pub fn high_water(&self) -> u64 {
+        high_water_of(self.extra.get(ID_HIGH_WATER))
+    }
+
+    fn peek_id(&self, prefix: &str) -> (String, u64) {
+        let used: std::collections::HashSet<&str> =
+            self.layout.pages.iter().flat_map(|p| p.modules.iter().map(|m| m.id.as_str()).chain(std::iter::once(p.id.as_str()))).collect();
+        // 旧配置没记过：从现有 id 里最大的编号往后数。所有前缀共用一个编号，换了类型的模块（按键改成语音框）也不会撞
+        let top = used.iter().filter_map(|id| id_number(id)).max().unwrap_or(0);
+        let mut n = self.high_water().max(top) + 1;
+        while used.contains(format!("{prefix}-{n}").as_str()) {
+            n += 1;
+        }
+        (format!("{prefix}-{n}"), n)
     }
 
     /// 发给手机的部分：布局、各按键有哪些按法和按住时怎么办、触控板和语音设置、是不是暂停了。动作本身留在电脑上执行。
@@ -658,12 +778,27 @@ impl Config {
                     .map(|m| {
                         let hold = m.hold_mode();
                         let others = hold.judges_other_triggers();
+                        // Only disclose a minimal UI hint for the remote window switcher.
+                        // Real key mappings remain on the PC and are executed through the existing button/hold protocol.
+                        let quick_key = {
+                            let mut active = m.behaviors.click.iter().filter(|step| step.active());
+                            match (active.next(), active.next()) {
+                                (Some(step), None) => match step.action.chord().as_deref() {
+                                    Some([key]) if key.eq_ignore_ascii_case("Alt") || key.eq_ignore_ascii_case("LAlt") => Some("Alt"),
+                                    Some([key]) if key.eq_ignore_ascii_case("Tab") => Some("Tab"),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        };
                         json!({
                             "id": m.id, "kind": m.kind.code(), "label": m.title(),
                             "x": num(m.x), "y": num(m.y), "w": num(m.w), "h": num(m.h),
-                            "hold": hold.code(),
+                            "hold": hold.code(), "quickKey": quick_key,
                             // 旧版 App（0.5.0）只认这个
                             "repeat": hold == HoldMode::RepeatClick,
+                            // 工作台里按之前先问一句（比如 Alt+F4）；旧版手机不认识这个字段，照常忽略
+                            "confirm": m.extra.get("confirm").and_then(Value::as_bool).unwrap_or(false),
                             "triggers": {
                                 "click": any_active(&m.behaviors.click),
                                 "doubleClick": others && any_active(&m.behaviors.double_click),
@@ -672,13 +807,19 @@ impl Config {
                         })
                     })
                     .collect();
-                json!({"id": page.id, "name": page.name, "modules": modules})
+                let mut json = json!({"id": page.id, "name": page.name, "modules": modules});
+                // 工作台专用页：手机普通按键页、「调整布局」都跳过它（工作台照样认这一页上的按键）；别的页不带这个字段
+                if workbench::is_storage_page(page) {
+                    json["workbench"] = Value::Bool(true);
+                }
+                json
             })
             .collect();
         let s = &self.settings;
         json!({
             "t": "config",
             "paused": !s.enabled,
+            "keyEditor": key_editor::editor_payload(self),
             // 当前方案（手机上显示用）
             "profile": {"id": self.active_profile_id, "name": self.active_profile_name(), "count": self.profiles.len()},
             "layout": {
@@ -686,6 +827,19 @@ impl Config {
                 "snap": SNAP, "minSize": MIN_SIZE,
                 "pages": pages,
             },
+            // Presentation-only configuration for landscape remote desktop.
+            // Android uses module IDs from the same original keyboard layout.
+            "screenWorkbench": self.extra.get("screenWorkbench").cloned().unwrap_or_else(|| json!({
+                "slots": ["switch", "mouse", "capture", "voice", "rail"],
+                "bindings": {}
+            })),
+            // Optional V2 portrait/landscape presentation. Old clients keep
+            // reading the untouched screenWorkbench field above.
+            "screenWorkbenchV2": self.extra.get("screenWorkbenchV2").cloned()
+                .unwrap_or(serde_json::Value::Null),
+            // schema 3：现在的工作台。手机看 Supported 判断电脑能不能存这个格式（旧电脑没有这个字段）
+            "screenWorkbenchV3": self.extra.get(workbench::KEY).cloned().unwrap_or(Value::Null),
+            "screenWorkbenchV3Supported": true,
             "touchpad": {
                 "sensitivity": s.touchpad.sensitivity, "acceleration": s.touchpad.acceleration,
                 "scrollSpeed": s.touchpad.scroll_speed, "naturalScroll": s.touchpad.natural_scroll,
@@ -1131,20 +1285,50 @@ pub fn to_text(config: &Config) -> String {
     serde_json::to_string_pretty(config).unwrap_or_default()
 }
 
+/// 工作台（schema 3）里引用了、但哪一页都已经没有的正式版按键 id。
+/// 只是查一下：保存前由 workbench::prune_missing 把这些引用拿掉，不再因为它们拦着不让存。
+/// 旧的 schema 2（screenWorkbenchV2）已经不用了，不看它
+pub fn missing_workbench_button_refs(config: &Config) -> Vec<String> {
+    let present = workbench::official_button_ids(config);
+    let mut missing: Vec<String> = config.extra.get(workbench::KEY).map(workbench::button_refs).unwrap_or_default();
+    missing.retain(|id| !present.contains(id));
+    missing.sort();
+    missing
+}
+
 /// 主界面里有没保存的改动、文件又被别处改了（比如手机上调了布局）：三方合并，两边的改动都留下（见 merge::merge3）。
 /// 合并出来的布局对不上（重叠、出界）返回 None。
 pub fn merge_configs(base: &Config, mine: &Config, theirs: &Config) -> Option<Config> {
-    let value = |c: &Config| serde_json::to_value(c).ok();
+    let value = |c: &Config| merge_value(c);
     let merged = merge::merge3(value(base).as_ref(), value(mine).as_ref(), value(theirs).as_ref())?;
     let config: Config = serde_json::from_value(merged).ok()?;
-    (!config.layout.pages.is_empty() && config.check_layout().is_ok()).then_some(config)
+    finish_merge(config, [base, mine, theirs])
 }
 
 /// 和 merge_configs 一样，但两边改了同一个地方就算合不了（返回 None）：撤销记录合进别处的改动时用
 pub fn merge_configs_strict(base: &Config, mine: &Config, theirs: &Config) -> Option<Config> {
-    let value = |c: &Config| serde_json::to_value(c).ok();
+    let value = |c: &Config| merge_value(c);
     let merged = merge::merge3_strict(value(base).as_ref(), value(mine).as_ref(), value(theirs).as_ref()).ok()??;
     let config: Config = serde_json::from_value(merged).ok()?;
+    finish_merge(config, [base, mine, theirs])
+}
+
+/// 合并用的样子：不带 idHighWater。两边各自建过按键时两边都改了它，按普通的值合并就会算冲突
+/// （撤销记录因此整段丢掉），所以单独处理：合并完取三份里最大的（发过的编号都不能再发）
+fn merge_value(config: &Config) -> Option<Value> {
+    let mut value = serde_json::to_value(config).ok()?;
+    if let Some(map) = value.as_object_mut() {
+        map.remove(ID_HIGH_WATER);
+    }
+    Some(value)
+}
+
+fn finish_merge(mut config: Config, sources: [&Config; 3]) -> Option<Config> {
+    let high = sources.iter().map(|c| c.high_water()).max().unwrap_or(0);
+    // 三份都没记过就不加这个键（旧配置合并完还是原来的样子）
+    if sources.iter().any(|c| c.extra.contains_key(ID_HIGH_WATER)) {
+        config.extra.insert(ID_HIGH_WATER.into(), json!(high));
+    }
     (!config.layout.pages.is_empty() && config.check_layout().is_ok()).then_some(config)
 }
 
@@ -1168,6 +1352,20 @@ pub fn read_status() -> Option<Status> {
 mod tests {
     use super::*;
 
+    /// 旧的 schema 2 不用了：里面引用的按键删掉了也不算（以前因为它整个配置都存不进去）
+    #[test]
+    fn old_v2_workbench_no_longer_blocks_saving() {
+        let mut config = Config::default();
+        config.extra.insert("screenWorkbenchV2".into(), serde_json::json!({
+            "schemaVersion": 2,
+            "portrait": [{"actionId": "button.future-key"}],
+            "landscape": [{"actionId": "voice"}]
+        }));
+        assert!(missing_workbench_button_refs(&config).is_empty());
+        assert!(!workbench::prune_missing(&mut config));
+        assert_eq!(config.extra["screenWorkbenchV2"]["portrait"][0]["actionId"], "button.future-key");
+    }
+
     /// 旧版（整数格子、没有连发字段）的配置照样能读，写回去整数还是整数
     #[test]
     fn old_config_still_loads() {
@@ -1185,6 +1383,278 @@ mod tests {
         let text = to_text(&config);
         assert!(text.contains("\"x\": 2.25,") && text.contains("\"h\": 0.75,"), "{text}");
         assert!(config.check_layout().is_ok());
+    }
+
+    /// Landscape UI preferences contain only references to existing PC buttons.
+    /// Older configs with no such field still receive safe default slots.
+    #[test]
+    fn screen_workbench_round_trip_and_phone_payload() {
+        let mut config = Config::default();
+        let fallback = config.phone_payload();
+        assert_eq!(fallback["screenWorkbench"]["slots"].as_array().unwrap().len(), 5);
+        config.extra.insert("screenWorkbench".into(), serde_json::json!({
+            "slots": ["voice", "switch", "mouse", "capture", "rail"],
+            "bindings": {"switch": "backspace"}
+        }));
+        let parsed = parse(&to_text(&config)).expect("roundtrip");
+        let value = parsed.phone_payload();
+        assert_eq!(value["screenWorkbench"]["slots"][0], "voice");
+        assert_eq!(value["screenWorkbench"]["bindings"]["switch"], "backspace");
+        assert_eq!(value["layout"]["pages"].as_array().unwrap().len(),
+            config.layout.pages.len());
+    }
+
+    #[test]
+    fn v2_phone_payload_does_not_change_v1_or_official_grid_layout() {
+        let mut config = Config::default();
+        let baseline = config.phone_payload();
+        assert!(baseline["screenWorkbenchV2"].is_null());
+        let v1 = serde_json::json!({
+            "slots": ["capture","voice","mouse","switch","rail"],
+            "bindings": {"capture": "my-original-action"}
+        });
+        config.extra.insert("screenWorkbench".into(), v1.clone());
+        let v2 = serde_json::json!({"schemaVersion": 2,
+            "portrait": [{"id":"ball.voice","actionId":"voice","container":"ball",
+                "x":0.8,"y":0.2,"width":0.1,"height":0.1,"visible":true,"order":0}],
+            "landscape": [{"id":"rail.voice","actionId":"voice","container":"rail",
+                "x":0.0,"y":0.2,"width":0.2,"height":0.1,"visible":true,"order":0}]
+        });
+        config.extra.insert("screenWorkbenchV2".into(), v2.clone());
+        let parsed = parse(&to_text(&config)).expect("roundtrip");
+        let output = parsed.phone_payload();
+        assert_eq!(output["screenWorkbenchV2"], v2);
+        assert_eq!(output["screenWorkbench"], v1);
+        assert_eq!(output["layout"], baseline["layout"]);
+        assert_eq!(output["layout"]["pages"].as_array().unwrap().len(),
+            config.layout.pages.len());
+    }
+
+    #[test]
+    fn v3_layout_and_confirm_flag_reach_the_phone() {
+        let mut config = Config::fresh();
+        assert!(workbench::ensure(&mut config));
+        let payload = config.phone_payload();
+        assert_eq!(payload["screenWorkbenchV3Supported"], true);
+        assert_eq!(payload["screenWorkbenchV3"]["schemaVersion"], 3);
+        let page = payload["layout"]["pages"].as_array().unwrap().iter()
+            .find(|p| p["id"] == workbench::SHORTCUT_PAGE).unwrap();
+        let modules = page["modules"].as_array().unwrap();
+        assert!(modules.iter().any(|m| m["label"] == "Alt+F4" && m["confirm"] == true));
+        assert!(modules.iter().any(|m| m["label"] == "Alt+E" && m["confirm"] == false));
+    }
+
+    /// 电脑上删掉了工作台用着的按键：查得出来是哪几个，保存前一拿掉就没了，剩下的布局照样合格
+    #[test]
+    fn v3_references_to_deleted_buttons_are_pruned() {
+        let mut config = Config::fresh();
+        workbench::ensure(&mut config);
+        assert!(missing_workbench_button_refs(&config).is_empty());
+        for page in &mut config.layout.pages {
+            if page.id == workbench::SHORTCUT_PAGE {
+                page.modules.clear();
+            }
+        }
+        assert_eq!(missing_workbench_button_refs(&config).len(), 6);
+        assert!(workbench::prune_missing(&mut config));
+        assert!(missing_workbench_button_refs(&config).is_empty());
+        let ids = workbench::official_button_ids(&config);
+        assert!(workbench::normalize(&config.extra[workbench::KEY], &ids).is_ok());
+    }
+
+    /// 新 id 只增不减，发过的最大编号记在 idHighWater（审查 #3：以前删掉的 id 下次新建马上又用上）
+    #[test]
+    fn new_ids_only_grow() {
+        let mut config = Config::fresh();
+        assert_eq!(config.high_water(), 0);
+        assert_eq!(config.new_id("button"), "button-1");
+        assert_eq!(config.extra[ID_HIGH_WATER], 1);
+        // 发出去的没加进配置、或者加进去又删了：都不再发；所有前缀共用一个编号
+        assert_eq!(config.new_id("button"), "button-2");
+        assert_eq!(config.new_id("page"), "page-3");
+        assert_eq!(config.next_id("button"), "button-4");
+        assert_eq!(config.next_id("button"), "button-4"); // next_id 只看不记
+        // 存成文件再读回来接着数
+        let mut again = parse(&to_text(&config)).unwrap();
+        assert_eq!(again.new_id("button"), "button-4");
+        // 旧配置（没记过）：从现有 id 最大的编号往后数，不管前缀
+        let mut old = Config::fresh();
+        old.layout.pages.push(Page {
+            id: "page-3".into(),
+            name: "第 2 页".into(),
+            modules: vec![Module { id: "button-7".into(), label: "x".into(), w: 1.0, h: 1.0, ..Default::default() }],
+        });
+        assert_eq!(old.new_id("touchpad"), "touchpad-8");
+        // 记下的比现有的大（大的那个按键删掉了）：按记下的
+        old.layout.pages.pop();
+        assert_eq!(old.new_id("button"), "button-9");
+        // 写坏了的记号当没有；奇怪的长编号不算
+        old.extra.insert(ID_HIGH_WATER.into(), serde_json::json!("x"));
+        assert_eq!(old.high_water(), 0);
+        old.extra.insert(ID_HIGH_WATER.into(), serde_json::json!(u64::MAX));
+        assert_eq!(old.high_water(), 0);
+        old.extra.insert(ID_HIGH_WATER.into(), serde_json::json!(12.0));
+        assert_eq!(old.high_water(), 12);
+        old.extra.insert(ID_HIGH_WATER.into(), serde_json::json!(-3));
+        assert_eq!(old.high_water(), 0);
+        old.layout.pages[0].modules[0].id = "esc-12345678901234567890".into();
+        assert_eq!(old.next_id("button"), "button-1");
+    }
+
+    /// 主界面和后台各自建过按键：idHighWater 两边都改了，合并时取大的，不算冲突（撤销记录不会因此整段丢掉）
+    #[test]
+    fn merges_take_the_larger_high_water() {
+        let mut base = Config::fresh();
+        base.new_id("button");
+        let mut mine = base.clone();
+        mine.new_id("button");
+        mine.layout.pages[0].modules[0].label = "改过".into();
+        let mut theirs = base.clone();
+        for _ in 0..3 {
+            theirs.new_id("button");
+        }
+        let merged = merge_configs(&base, &mine, &theirs).unwrap();
+        assert_eq!(merged.high_water(), 4);
+        assert_eq!(merged.layout.pages[0].modules[0].label, "改过");
+        let strict = merge_configs_strict(&base, &mine, &theirs).unwrap();
+        assert_eq!(strict.high_water(), 4);
+        // 撤销记录（比 base 还旧）合并别处的改动：一样取大的
+        let older = Config::fresh();
+        assert_eq!(merge_configs_strict(&base, &older, &theirs).unwrap().high_water(), 4);
+        // 都没记过：合并完也不多出这个键
+        let plain = Config::fresh();
+        assert!(merge_configs(&plain, &plain, &plain).unwrap().extra.get(ID_HIGH_WATER).is_none());
+    }
+
+    /// 导入遥控器映射的新页面：id 先用 next_id 定，加进配置时记下编号
+    #[test]
+    fn imported_page_id_is_recorded() {
+        let mut config = Config::fresh();
+        let page = Page { id: config.next_id("remote"), name: "遥控器".into(), modules: vec![] };
+        assert_eq!(page.id, "remote-1");
+        config.add_page_as_profile(page, "遥控器映射");
+        assert_eq!(config.high_water(), 1);
+        assert_eq!(config.new_id("remote"), "remote-2");
+    }
+
+    /// 放了一块电脑屏幕的配置
+    fn with_screen_module() -> Config {
+        let mut config = Config::fresh();
+        config.layout.pages.push(Page {
+            id: "screen-page".into(),
+            name: "屏幕".into(),
+            modules: vec![Module {
+                id: "screen-1".into(),
+                kind: ModuleKind::Screen,
+                label: ModuleKind::Screen.name().into(),
+                x: 0.0,
+                y: 0.0,
+                w: 4.0,
+                h: 3.0,
+                ..Default::default()
+            }],
+        });
+        config
+    }
+
+    /// 新增屏幕模块不改变旧布局格式：写进文件再读回来还是电脑屏幕，发给手机的类型代码还是 screen
+    #[test]
+    fn screen_module_serializes_and_keeps_old_layout() {
+        assert_eq!(serde_json::to_string(&ModuleKind::Screen).unwrap(), "\"screen\"");
+        assert_eq!(serde_json::from_str::<ModuleKind>("\"screen\"").unwrap(), ModuleKind::Screen);
+        assert_eq!(ModuleKind::ALL.len(), 5);
+        let config = with_screen_module();
+        let old_count = config.layout.pages[0].modules.len();
+        let text = to_text(&config);
+        let parsed = parse(&text).unwrap();
+        assert_eq!(parsed.layout.pages[0].modules.len(), old_count);
+        let screen = &parsed.layout.pages[1].modules[0];
+        assert_eq!(screen.kind, ModuleKind::Screen);
+        // 内存里不留文件里的标记，再写一遍和第一遍一样
+        assert!(screen.extra.get(SCREEN_FLAG).is_none());
+        assert_eq!(to_text(&parsed), text);
+        assert_eq!(parsed.phone_payload()["layout"]["pages"][1]["modules"][0]["kind"], "screen");
+        assert!(parsed.check_layout().is_ok());
+        // 和文件里的样子一来一回（合并、撤销记录都这样转）也还是电脑屏幕
+        let value = serde_json::to_value(&config).unwrap();
+        let back: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(back.layout.pages[1].modules[0].kind, ModuleKind::Screen);
+    }
+
+    /// 写进文件、导出的备份里都没有 "kind": "screen"：写成触控板加 "screen": true
+    #[test]
+    fn screen_module_is_written_as_flagged_touchpad() {
+        let config = with_screen_module();
+        let text = to_text(&config);
+        assert!(!text.contains("\"kind\": \"screen\""), "{text}");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let module = &value["layout"]["pages"][1]["modules"][0];
+        assert_eq!(module["kind"], "touchpad");
+        assert_eq!(module["screen"], true);
+        let backup = transfer::export_document(&config, true, "test");
+        assert!(!backup.contains("\"kind\": \"screen\""), "{backup}");
+        assert!(backup.contains("\"screen\": true"), "{backup}");
+    }
+
+    /// 旧开发版写的 "kind": "screen" 照样读得出来；普通触控板（没有标记、标记不是 true）还是触控板
+    #[test]
+    fn old_screen_kind_still_loads() {
+        let old = r#"{"version":4,"layout":{"columns":4,"rows":8,"pages":[{"id":"main","name":"主页","modules":[
+            {"id":"screen-1","kind":"screen","label":"电脑屏幕","x":0,"y":0,"w":4,"h":3},
+            {"id":"pad","kind":"touchpad","label":"触控板","x":0,"y":3,"w":2,"h":2},
+            {"id":"pad2","kind":"touchpad","label":"触控板","x":2,"y":3,"w":2,"h":2,"screen":false}]}]}}"#;
+        let config = parse(old).unwrap();
+        let modules = &config.layout.pages[0].modules;
+        assert_eq!(modules[0].kind, ModuleKind::Screen);
+        assert!(modules[0].extra.get(SCREEN_FLAG).is_none());
+        assert_eq!(modules[1].kind, ModuleKind::Touchpad);
+        assert_eq!(modules[2].kind, ModuleKind::Touchpad);
+        assert_eq!(modules[2].extra.get(SCREEN_FLAG), Some(&Value::Bool(false)));
+        let written: Value = serde_json::from_str(&to_text(&config)).unwrap();
+        assert_eq!(written["layout"]["pages"][0]["modules"][0]["kind"], "touchpad");
+        assert_eq!(written["layout"]["pages"][0]["modules"][0]["screen"], true);
+        assert!(written["layout"]["pages"][0]["modules"][1].get("screen").is_none());
+    }
+
+    /// 正式版 0.7.22 的模块类型只有四种（照它的写法抄一份）：开发版写的配置它要整个读得懂，
+    /// 电脑屏幕在它那里是一块触控板，标记原样留在它的「看不懂的字段」里
+    #[test]
+    fn official_release_can_read_what_we_write() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        enum OfficialKind {
+            Button,
+            Touchpad,
+            Voice,
+            VoiceButton,
+        }
+        #[derive(Deserialize)]
+        struct OfficialModule {
+            kind: OfficialKind,
+            #[serde(flatten)]
+            extra: Map<String, Value>,
+        }
+        #[derive(Deserialize)]
+        struct OfficialPage {
+            modules: Vec<OfficialModule>,
+        }
+        #[derive(Deserialize)]
+        struct OfficialLayout {
+            pages: Vec<OfficialPage>,
+        }
+        #[derive(Deserialize)]
+        struct OfficialConfig {
+            layout: OfficialLayout,
+        }
+        let mut config = with_screen_module();
+        workbench::ensure(&mut config);
+        for text in [to_text(&config), to_text(&parse(&to_text(&config)).unwrap())] {
+            let official: OfficialConfig = serde_json::from_str(&text).expect("正式版读得懂");
+            let screen = &official.layout.pages[1].modules[0];
+            assert_eq!(screen.kind, OfficialKind::Touchpad);
+            assert_eq!(screen.extra.get(SCREEN_FLAG), Some(&Value::Bool(true)));
+            assert_eq!(official.layout.pages[0].modules[0].kind, OfficialKind::VoiceButton);
+        }
     }
 
     #[test]

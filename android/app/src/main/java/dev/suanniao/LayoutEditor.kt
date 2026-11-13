@@ -186,7 +186,12 @@ class LayoutEditor(
         val dx = ((x - downX) / grid.cellWidth).toDouble()
         val dy = ((y - downY) / grid.cellHeight).toDouble()
         val others = items.filter { it !== item }.map { grid.cellOf(it.view) }
-        val (cell, ok) = drag(start, edges, dx, dy, if (snap) snapStep else null, minSize, others, grid.columns.toDouble(), grid.rows.toDouble())
+        val step = if (snap) snapStep else null
+        val columns = grid.columns.toDouble()
+        val rows = grid.rows.toDouble()
+        var (cell, ok) = drag(start, edges, dx, dy, step, minSize, others, columns, rows)
+        // 电脑屏幕模块改大小：高按画面比例跟着宽走（不然拉大以后上下一大片空白，K6）
+        if (edges != 0) screenRatio(item)?.let { k -> cell = fitRatio(start, cell, edges, k, step, minSize, others, columns, rows) }
         val previous = target
         target = cell
         targetOk = ok
@@ -234,6 +239,19 @@ class LayoutEditor(
         }
         listener.onEditChanged(changed())
         grid.invalidate()
+    }
+
+    /**
+     * 电脑屏幕模块：高（格）= 宽（格）× 这个数 = 格子宽 / 格子高 × 桌面高 / 桌面宽，画面多大模块就多大。
+     * 格子用手机上真的大小；桌面尺寸用画面流里最近一次知道的，还没见过画面就当 16:9。别的模块返回 null
+     */
+    private fun screenRatio(item: Item): Double? {
+        val screen = item.view as? ScreenView ?: return null
+        val cw = grid.cellWidth.toDouble()
+        val ch = grid.cellHeight.toDouble()
+        if (cw <= 0 || ch <= 0) return null
+        val (w, h) = screen.knownDesktopSize().takeIf { it.first > 0 && it.second > 0 } ?: (16 to 9)
+        return cw / ch * h / w
     }
 
     /**
@@ -520,6 +538,29 @@ class LayoutEditor(
             val (l2, r2) = clampH(l, r, t2, b2)
             val c = Cell(l2, t2, r2 - l2, b2 - t2)
             return (if (c.w * c.h > a.w * a.h + EPS) c else a).tidy() to true
+        }
+
+        /**
+         * 电脑屏幕模块改大小（K6，电脑上的布局编辑器同一个规则）：drag 算出来的 dragged 再按画面比例定高，高 = 宽 × k。
+         * 拖了左边或右边（含四个角）：宽用拖出来的；只拖上边或下边：反过来按拖出来的高算宽（左边不动）。
+         * 高按步长取整（自由模式取到 0.01 格），不小于 minSize；拖上边时下边不动，拖左边时右边不动。
+         * 出界、碰到别的模块就把宽一档一档缩小，实在放不下就保持原样（start）。
+         */
+        fun fitRatio(start: Cell, dragged: Cell, edges: Int, k: Double, step: Double?, minSize: Double, others: List<Cell>, columns: Double, rows: Double): Cell {
+            if (!(k > 0) || !k.isFinite()) return dragged
+            val unit = step?.takeIf { it > 0 } ?: 0.01
+            val keepRight = (edges and LEFT) != 0
+            val keepBottom = (edges and TOP) != 0
+            val horizontal = (edges and (LEFT or RIGHT)) != 0
+            var w = if (horizontal) dragged.w else max(minSize, snapTo(dragged.h / k, step))
+            w = min(w, if (keepRight) start.right else columns - start.x)
+            while (w >= minSize - EPS) {
+                val h = max(minSize, snapTo(w * k, step))
+                val c = Cell(if (keepRight) start.right - w else start.x, if (keepBottom) start.bottom - h else start.y, w, h)
+                if (c.x >= -EPS && c.y >= -EPS && c.right <= columns + EPS && c.bottom <= rows + EPS && isFree(c, others)) return c.tidy()
+                w -= unit
+            }
+            return start
         }
     }
 }

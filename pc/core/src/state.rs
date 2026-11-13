@@ -4,7 +4,7 @@
 //! （只读，不覆盖坏文件），并在 status.json 里写上 configError，主界面据此显示横幅。坏文件另存一份带时间的。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, RwLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::SystemTime;
 
 use suanniao_config::{self as config, Config, Rect, Recent, Status};
@@ -17,6 +17,14 @@ static STATUS: LazyLock<Mutex<Status>> = LazyLock::new(|| Mutex::new(Status::def
 static STATUS_DIRTY: AtomicBool = AtomicBool::new(false);
 /// 后台自己写配置文件后的修改时间：看文件的线程见到它就知道不是别人改的，不用再读一遍
 static OWN_WRITE: Mutex<Option<SystemTime>> = Mutex::new(None);
+/// 后台每一次「读文件 → 改 → 写回」都拿着这把锁（审查 #15）：手机存布局、建常用文本（会话线程）、
+/// 切换方案（动作线程）、托盘暂停可能同时发生，各读各的再各写各的，先写的那份改动就被后写的盖掉了
+static CONFIG_WRITE: Mutex<()> = Mutex::new(());
+
+/// 拿写配置的锁。前面有人拿着锁时出了错（panic）也照样能用：文件是整份写的，不会写一半
+fn write_lock() -> MutexGuard<'static, ()> {
+    CONFIG_WRITE.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub fn config() -> Config {
     CONFIG.read().unwrap().clone()
@@ -216,14 +224,150 @@ pub fn record_backspace() {
 /// 手机上调好的布局：以文件里现在的配置为准（主界面可能刚改过、这边还没读到），改好位置写回文件。
 /// 写完马上换成新配置；看文件的线程认得这次修改是自己写的，不会再读一遍。
 pub fn save_phone_layout(page: &str, items: &[(String, Rect)]) -> Result<usize, String> {
+    let _guard = write_lock();
     let mut fresh = config::load_existing().ok_or("电脑上的配置文件读不出来")?;
     let applied = fresh.set_page_layout(page, items)?;
     write_own(fresh)?;
     Ok(applied)
 }
 
+/// The landscape presentation is a list of five UI slots, not duplicate keyboard actions.
+/// Validate only known slot names and original module IDs, then persist in the existing
+/// PC config and let normal config broadcast synchronize connected phones.
+pub fn save_screen_workbench(value: &serde_json::Value) -> Result<(), String> {
+    let slots = value.get("slots").and_then(serde_json::Value::as_array)
+        .ok_or("缺少工作台槽位")?;
+    const VALID: [&str; 5] = ["switch", "mouse", "capture", "voice", "rail"];
+    if slots.len() != VALID.len() { return Err("工作台需要五个槽位".into()); }
+    let mut seen = std::collections::HashSet::new();
+    for slot in slots {
+        let name = slot.as_str().ok_or("槽位格式不正确")?;
+        if !VALID.contains(&name) || !seen.insert(name) {
+            return Err("工作台槽位重复或无效".into());
+        }
+    }
+    let _guard = write_lock();
+    let mut fresh = config::load_existing().ok_or("电脑配置不可用")?;
+    let bindings = value.get("bindings").and_then(serde_json::Value::as_object)
+        .ok_or("工作台绑定必须是对象")?;
+    let mut normalized = serde_json::Map::new();
+    for kind in ["switch", "capture"] {
+        if let Some(id) = bindings.get(kind).and_then(serde_json::Value::as_str) {
+            if id.len() > 100 { return Err("绑定 ID 过长".into()); }
+            if !id.is_empty() {
+                let allowed = fresh.layout.pages.iter().flat_map(|p| &p.modules)
+                    .any(|m| m.id == id && m.kind == config::ModuleKind::Button);
+                if !allowed { return Err("绑定的电脑按钮不存在".into()); }
+                normalized.insert(kind.to_owned(), serde_json::Value::String(id.to_owned()));
+            }
+        }
+    }
+    // Keep toolbar presentation in the same canonical PC config as the
+    // original workbench. Never duplicate or redefine keyboard mappings.
+    const TOOL_KEYS: [&str; 14] = [
+        "wechat", "snip", "backspace", "delete", "left", "right",
+        "up", "down", "space", "selectAll", "copy", "paste", "enter", "esc",
+    ];
+    let toolbar = value.get("toolbar");
+    let rows = toolbar.and_then(|v| v.get("rows")).and_then(|v| v.as_u64()).unwrap_or(1);
+    if !(1..=2).contains(&rows) { return Err("工具栏只支持一排或两排".into()); }
+    let default_keys = ["wechat", "snip", "backspace", "delete",
+        "left", "right", "selectAll", "copy", "paste", "enter", "esc"];
+    let key_values = toolbar.and_then(|v| v.get("keys")).and_then(|v| v.as_array());
+    let mut keys = Vec::new();
+    if let Some(values) = key_values {
+        if values.is_empty() || values.len() > TOOL_KEYS.len() {
+            return Err("工具栏按钮数量不正确".into());
+        }
+        for key in values {
+            let name = key.as_str().ok_or("工具栏按钮格式不正确")?;
+            if !TOOL_KEYS.contains(&name) || keys.contains(&name) {
+                return Err("工具栏按钮重复或不支持".into());
+            }
+            keys.push(name);
+        }
+    } else {
+        keys.extend(default_keys.iter().copied());
+    }
+    fresh.extra.insert("screenWorkbench".into(), serde_json::json!({
+        "slots": slots, "bindings": normalized,
+        "toolbar": {"rows": rows, "keys": keys},
+    }));
+    write_own(fresh)
+}
+
+/// Persist the versioned remote-workbench presentation independently of V1.
+///
+/// Invalid V2 payloads never call write_own and therefore cannot alter the
+/// user's current five-slot workbench or official phone layout. A successful
+/// write is echoed through the existing config broadcast and explicit ACK.
+pub fn save_screen_workbench_v2(value: &serde_json::Value) -> Result<(), String> {
+    let _guard = write_lock();
+    let mut fresh = config::load_existing().ok_or("电脑配置不可用")?;
+    let button_ids: Vec<String> = fresh.layout.pages.iter()
+        .flat_map(|page| &page.modules)
+        .filter(|module| module.kind == config::ModuleKind::Button)
+        .map(|module| module.id.clone())
+        .collect();
+    let normalized = crate::workbench_v2::normalize(value, &button_ids)?;
+    crate::workbench_v2::refuse_widget_geometry_downgrade(
+        fresh.extra.get("screenWorkbenchV2"), &normalized)?;
+    fresh.extra.insert("screenWorkbenchV2".into(), normalized);
+    write_own(fresh)
+}
+
+/// 工作台布局（schema 3）：电脑校验通过才写进配置；不合格原样回绝，配置一个字都不动。
+/// 存好以后专用页上布局里已经不用的按键一起删掉（K2：手机「调整布局」里新建了又没放、或者拿掉了的热键）
+pub fn save_screen_workbench_v3(value: &serde_json::Value) -> Result<(), String> {
+    let _guard = write_lock();
+    let mut fresh = config::load_existing().ok_or("电脑配置不可用")?;
+    let ids = config::workbench::official_button_ids(&fresh);
+    let normalized = config::workbench::normalize(value, &ids)?;
+    fresh.extra.insert(config::workbench::KEY.into(), normalized);
+    if config::workbench::collect_unused_storage_buttons(&mut fresh) {
+        log!("🧹 远程工作台没再用的按键已删掉");
+    }
+    write_own(fresh)
+}
+
+/// 没有合格的工作台布局就补上（缺的默认热键建在「远程快捷键」页）；有点不合格的修好；已有的布局补一次后加的「发图片」（只补一次）。
+pub fn ensure_workbench_v3() -> Result<bool, String> {
+    let _guard = write_lock();
+    let mut fresh = config::load_existing().ok_or("电脑配置不可用")?;
+    if !config::workbench::ensure(&mut fresh) {
+        return Ok(false);
+    }
+    write_own(fresh)?;
+    Ok(true)
+}
+
+/// 「恢复默认」：快捷发送那一排留着，别的按默认重新生成（默认热键按组合键复用，不会重复建），
+/// 然后删掉专用页上已经不用的按键（同 save_screen_workbench_v3）
+pub fn reset_workbench_v3() -> Result<(), String> {
+    let _guard = write_lock();
+    let mut fresh = config::load_existing().ok_or("电脑配置不可用")?;
+    if !config::workbench::reset(&mut fresh) {
+        return Err("默认布局生成不了".into());
+    }
+    if config::workbench::collect_unused_storage_buttons(&mut fresh) {
+        log!("🧹 远程工作台没再用的按键已删掉");
+    }
+    write_own(fresh)
+}
+
+/// Apply an ordinary official key edit to a fresh copy of the PC config.
+/// 手机上新建、修改、删除常用文本（createText / editText / deleteText）也走这里，一次请求只写一次配置
+pub fn save_key_edit(request: &serde_json::Value) -> Result<String, String> {
+    let _guard = write_lock();
+    let mut fresh = config::load_existing().ok_or("电脑配置不可用")?;
+    let id = config::key_editor::apply_request(&mut fresh, request)?;
+    write_own(fresh)?;
+    Ok(id)
+}
+
 /// 「切换方案」动作：以文件为准，切到上一个 / 下一个方案后写回。返回（原来的名字，新的名字）；没得切返回 None
 pub fn switch_profile(direction: &str, wrap: bool) -> Result<Option<(String, String)>, String> {
+    let _guard = write_lock();
     let mut fresh = config::load_existing().ok_or("电脑上的配置文件读不出来")?;
     let Some(target) = fresh.adjacent_profile(direction, wrap) else { return Ok(None) };
     let names = fresh.switch_profile(&target);
@@ -233,13 +377,17 @@ pub fn switch_profile(direction: &str, wrap: bool) -> Result<Option<(String, Str
 
 /// 托盘菜单、手机上的「暂停按键 / 恢复按键」：同样以文件为准，只改总开关
 pub fn set_mapping_enabled(enabled: bool) -> Result<(), String> {
+    let _guard = write_lock();
     let mut fresh = config::load_existing().ok_or("电脑上的配置文件读不出来")?;
     fresh.settings.enabled = enabled;
     write_own(fresh)
 }
 
-/// 后台自己写配置文件：写完马上换成新配置，并记下修改时间（看文件的线程见到就知道不用再读）
-fn write_own(fresh: Config) -> Result<(), String> {
+/// 后台自己写配置文件：写完马上换成新配置，并记下修改时间（看文件的线程见到就知道不用再读）。
+/// 写之前顺手去掉工作台里指向已经没有的按键的引用（手机删了常用文本、别的版本删了按键），手机那边不会留个空引用。
+/// 调用的要拿着 write_lock（从读文件那一刻起）
+fn write_own(mut fresh: Config) -> Result<(), String> {
+    config::workbench::prune_missing(&mut fresh);
     config::save(&fresh).map_err(|e| format!("写配置文件失败：{e}"))?;
     *OWN_WRITE.lock().unwrap() = std::fs::metadata(config::config_path()).and_then(|m| m.modified()).ok();
     input::set_smoothing(fresh.settings.touchpad.smoothing);

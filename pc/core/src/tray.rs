@@ -14,7 +14,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{actions, input, link, log, overlay, state, update};
+use crate::{actions, link, log, overlay, state, update};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const MENU_OPEN: usize = 1;
@@ -186,14 +186,14 @@ fn run_ui(args: &[&str]) {
     }
 }
 
-/// 暂停按键 / 恢复按键：写进配置（主界面会发现、手机上会显示），暂停时取消排队的动作、松开按着的键。
+/// 暂停按键 / 恢复按键：写进配置（主界面会发现、手机上会显示），暂停时取消排队的动作、松开按着的键（并告诉手机）。
 /// 托盘菜单和手机上的「暂停按键」都走这里；from 是谁让改的（写日志用）
 pub fn set_enabled(enabled: bool, from: &str) {
     match state::set_mapping_enabled(enabled) {
         Ok(()) => {
             if !enabled {
                 actions::cancel();
-                input::release_keys_all();
+                link::release_all_keys();
             }
             link::push_config();
             log!("{} {from}：{}", if enabled { "▶" } else { "⏸" }, if enabled { "恢复按键" } else { "暂停按键" });

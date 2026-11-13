@@ -3,6 +3,14 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// 检查更新看哪个 GitHub 仓库（写进 BuildConfig.UPDATE_REPO）。默认是作者的 drhhhao/SuanNIAO，这个默认值别改。
+// 自己打的开发版加 -PupdateRepo=用户名/仓库名（tools/build-android-dev-full.ps1 会传），就只看那个仓库的发布，
+// 不查 Gitee 镜像，也不会提示更新成作者发的正式版
+val updateRepo = providers.gradleProperty("updateRepo").orNull?.trim()?.takeIf { it.isNotEmpty() } ?: "drhhhao/SuanNIAO"
+if (!Regex("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+").matches(updateRepo)) {
+    throw GradleException("updateRepo 要写成「用户名/仓库名」，比如 drhhhao/SuanNIAO：$updateRepo")
+}
+
 android {
     // 包名定了就别再改：改了就成了另一个 App，装着旧包的手机升级不上来，设置、语音模型都得重来。
     // 改名前叫 dev.phonepad（0.9.3 以前）
@@ -15,8 +23,11 @@ android {
         targetSdk = 35
         versionCode = 36
         versionName = "0.9.21"
+        // Test-only gesture injector, not included in dev/release app APK.
+        testInstrumentationRunner = "dev.suanniao.TouchGestureInstrumentation"
         // 只给 64 位 ARM 手机用，本地语音识别的原生库只打这一种，安装包小很多
         ndk { abiFilters += "arm64-v8a" }
+        buildConfigField("String", "UPDATE_REPO", "\"$updateRepo\"")
     }
 
     buildFeatures {
@@ -37,6 +48,10 @@ android {
     }
 
     buildTypes {
+        // 开发版与正式版并存，防止安装/调试时覆盖原有蒜鸟配置和语音模型。
+        debug {
+            applicationIdSuffix = ".dev"
+        }
         release {
             signingConfig = signingConfigs.findByName("release")
         }

@@ -633,7 +633,10 @@ impl Ctx {
             if c == char::from(Key::Escape) {
                 *self.record.borrow_mut() = Record::default();
                 self.set_record_hint(&[]);
-                self.restore_focus();
+                // 「新建热键」对话框（下标 -1）自己管焦点：焦点还给主窗口的话，对话框里的输入框就点不进去了
+                if index >= 0 {
+                    self.restore_focus();
+                }
                 return 2;
             }
             if let Some(name) = modifier {
@@ -682,6 +685,11 @@ impl Ctx {
 
     /// 录到的键填进第 index 步：「按键」录到一个键就是这个键，录到组合键就改成「组合键」
     fn set_recorded(self: &Rc<Self>, index: i32, keys: Vec<String>) {
+        // 下标是 -1：远程工作台「新建热键」对话框里录的，填进对话框（不改映射页的哪一步）
+        if index < 0 {
+            self.wb_recorded(keys);
+            return;
+        }
         let text = keys.join("+");
         self.checkpoint(None, &format!("给「{}」第 {} 步录了 {text}", self.map_place(), index + 1));
         let mut became_combo = false;

@@ -12,6 +12,11 @@
 //!
 //! 读到的结果和用户的选择（跳过这个版本、以后再说、自动检查开关）记在 `%APPDATA%\SuanNIAO\update.json`，
 //! 后台和主界面都读写这个文件。
+//!
+//! 开发版：编译时设环境变量 SUANNIAO_UPDATE_REPO（「用户/仓库」）就换一个 GitHub 仓库检查更新。
+//! 只读那个仓库最新发布里的 latest.json、只从那次发布下载安装包，不碰 Gitee；签名照旧有就核对、没有就认；
+//! 那个仓库还没发过版本（404）就当成已是最新，不算没查成。查到的结果另记一个文件（见 Source::state_file），
+//! 正式版和开发版装在同一台电脑上也不会把对方查到的版本当成自己的新版本。不设就和原来完全一样。
 
 use std::ffi::c_void;
 use std::io::{Read, Write};
@@ -46,11 +51,122 @@ const UPDATE_PUBLIC_KEY: [u8; 32] = [
 /// 最新一次发布的网页（latest.json 里没写发布页时，「去网页下载」打开这个）
 pub const RELEASES_PAGE: &str = "https://github.com/drhhhao/SuanNIAO/releases/latest";
 
+/// 蒜鸟自己的 GitHub 仓库（上面这几个地址都是它的）
+pub const DEFAULT_REPO: &str = "drhhhao/SuanNIAO";
+
+/// 开发版编译时用环境变量 SUANNIAO_UPDATE_REPO 指定的检查更新的仓库（「用户/仓库」）；不设、设成空的都是 DEFAULT_REPO
+const BUILD_REPO: Option<&str> = option_env!("SUANNIAO_UPDATE_REPO");
+
+// SUANNIAO_UPDATE_REPO 写得不像「用户/仓库」就编译不过：不然开发版会一直读一个不存在的地址，悄悄当成已是最新
+const _: () = assert!(
+    match BUILD_REPO {
+        Some(repo) => repo.is_empty() || repo_name_ok(repo),
+        None => true,
+    },
+    "环境变量 SUANNIAO_UPDATE_REPO 要写成「用户/仓库」，比如 drhhhao/SuanNIAO"
+);
+
 /// 测试用：环境变量 SUANNIAO_UPDATE_URL 换一个地址读 latest.json（比如本机起的 http 服务）
 const URL_ENV: &str = "SUANNIAO_UPDATE_URL";
 
 /// 用户取消下载时 download 返回的错误
 pub const CANCELLED: &str = "已取消";
+
+/// 「用户/仓库」：正好一个斜杠，两边都不空，只有英文字母、数字和 - _ .
+const fn repo_name_ok(repo: &str) -> bool {
+    let bytes = repo.as_bytes();
+    let (mut i, mut slashes, mut part) = (0, 0, 0);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'/' {
+            if part == 0 {
+                return false;
+            }
+            slashes += 1;
+            part = 0;
+        } else if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
+            part += 1;
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    slashes == 1 && part > 0
+}
+
+/// 从哪个 GitHub 仓库检查更新
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Source {
+    /// 「用户/仓库」
+    repo: &'static str,
+    /// 是蒜鸟自己的仓库：先读 Gitee 上的 latest.json，安装包也先从 Gitee 下
+    official: bool,
+}
+
+impl Source {
+    /// 编译时指定的仓库；没指定、空的、写的就是蒜鸟自己的仓库，都和原来一样
+    fn of(repo: Option<&'static str>) -> Self {
+        match repo {
+            Some(repo) if !repo.is_empty() && !repo.eq_ignore_ascii_case(DEFAULT_REPO) => Self { repo, official: false },
+            _ => Self { repo: DEFAULT_REPO, official: true },
+        }
+    }
+
+    /// 按顺序读哪几份 latest.json：(地址, 一定要有签名)。
+    /// 蒜鸟自己的仓库先读 Gitee 的（一定要有对得上的签名），读不到再读 GitHub 的；别的仓库只读它在 GitHub 上最新发布里的
+    fn manifest_urls(&self) -> Vec<(String, bool)> {
+        if self.official {
+            vec![(GITEE_MANIFEST_URL.to_string(), true), (MANIFEST_URL.to_string(), false)]
+        } else {
+            vec![(format!("https://github.com/{}/releases/latest/download/latest.json", self.repo), false)]
+        }
+    }
+
+    /// 最新一次发布的网页
+    fn releases_page(&self) -> String {
+        format!("https://github.com/{}/releases/latest", self.repo)
+    }
+
+    /// url 在这个仓库的 GitHub 网址下面（rest 是仓库后面那段，比如 "releases/download/"）。
+    /// 别的仓库不分大小写：GitHub 的用户名、仓库名不分大小写，编译时写的可能和发布里的不一样
+    fn on_github(&self, url: &str, rest: &str) -> bool {
+        let prefix = format!("https://github.com/{}/{rest}", self.repo);
+        if self.official {
+            url.starts_with(&prefix)
+        } else {
+            url.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+        }
+    }
+
+    /// 查到的结果记在哪个文件：蒜鸟自己的仓库是 update.json，别的仓库各记各的（update-用户-仓库.json）
+    fn state_file(&self) -> String {
+        if self.official {
+            "update.json".to_string()
+        } else {
+            format!("update-{}.json", self.repo.replace('/', "-"))
+        }
+    }
+}
+
+fn source() -> Source {
+    Source::of(BUILD_REPO)
+}
+
+/// 开发版编译时指定的检查更新的仓库；正式版（没指定）是 None
+pub fn custom_repo() -> Option<&'static str> {
+    let source = source();
+    (!source.official).then_some(source.repo)
+}
+
+/// 「去网页下载」打开哪个网页：latest.json 里写的这次发布的网页（只认检查更新的那个仓库的），不然是最新一次发布的网页
+pub fn release_page(page: &str) -> String {
+    let source = source();
+    if source.on_github(page, "") {
+        page.to_string()
+    } else {
+        source.releases_page()
+    }
+}
 
 /// latest.json：一次发布的两端版本
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -140,7 +256,7 @@ impl State {
 }
 
 pub fn state_path() -> PathBuf {
-    config::data_dir().join("update.json")
+    config::data_dir().join(source().state_file())
 }
 
 /// 读 update.json（没有或者读不出来就是默认值：自动检查开着，什么都没查到）
@@ -203,15 +319,16 @@ pub fn newer(candidate: &str, current: &str) -> bool {
     !candidate.trim().is_empty() && version_tuple(candidate) > version_tuple(current)
 }
 
-/// 联网读一次 latest.json，结果记进 update.json（没查成也记下时间和原因）
-pub fn check() -> Result<Manifest, String> {
+/// 联网读一次 latest.json，结果记进 update.json（没查成也记下时间和原因）。
+/// Ok(None)：开发版指定的仓库还没发过版本，当成已是最新（记下的新版本也清掉）
+pub fn check() -> Result<Option<Manifest>, String> {
     let result = fetch_manifest();
     update(|state| {
         state.checked = config::now_secs();
         match &result {
             Ok(manifest) => {
                 state.error.clear();
-                state.latest = Some(manifest.clone());
+                state.latest = manifest.clone();
             }
             Err(e) => state.error = e.clone(),
         }
@@ -223,21 +340,29 @@ fn test_url() -> Option<String> {
     std::env::var(URL_ENV).ok().filter(|url| !url.trim().is_empty())
 }
 
-/// 先读 Gitee 的（一定要有对得上的签名），读不到再读 GitHub 的；都没读到时说 GitHub 那边的原因
-fn fetch_manifest() -> Result<Manifest, String> {
+/// 按 Source::manifest_urls 的顺序读，读到一份就用；都没读到时说最后那个（GitHub 那边）的原因
+fn fetch_manifest() -> Result<Option<Manifest>, String> {
+    let source = source();
     if let Some(url) = test_url() {
-        return fetch_from(&url, false);
+        return fetch_from(&url, false, source);
     }
-    fetch_from(GITEE_MANIFEST_URL, true).or_else(|_| fetch_from(MANIFEST_URL, false))
+    let mut result = Err(String::new());
+    for (url, need_signature) in source.manifest_urls() {
+        result = fetch_from(&url, need_signature, source);
+        if result.is_ok() {
+            break;
+        }
+    }
+    result
 }
 
-/// 读一份 latest.json 和它的签名（同一个地址后面加 .sig）。need_signature：没有签名就不认
-fn fetch_from(url: &str, need_signature: bool) -> Result<Manifest, String> {
-    let body = match get_small(url)? {
-        (200, body) => body,
-        (404, _) => return Err("发布页上还没有版本信息".into()),
-        (status, _) => return Err(format!("服务器返回 {status}")),
-    };
+/// 读一份 latest.json 和它的签名（同一个地址后面加 .sig）。need_signature：没有签名就不认。
+/// Ok(None)：开发版指定的仓库还没发过版本
+fn fetch_from(url: &str, need_signature: bool, source: Source) -> Result<Option<Manifest>, String> {
+    let (status, body) = get_small(url)?;
+    if !release_found(status, source)? {
+        return Ok(None);
+    }
     match get_small(&format!("{url}.sig"))? {
         (200, signature) => {
             if !signed(&UPDATE_PUBLIC_KEY, &body, &signature) {
@@ -247,14 +372,34 @@ fn fetch_from(url: &str, need_signature: bool) -> Result<Manifest, String> {
         (404, _) if !need_signature => {}
         (status, _) => return Err(format!("读不到版本信息的签名（服务器返回 {status}）")),
     }
-    let mut manifest: Manifest = serde_json::from_slice(&body).map_err(|_| "版本信息看不懂".to_string())?;
+    parse_manifest(&body, source, test_url().is_some()).map(Some)
+}
+
+/// latest.json 那个地址回的状态码：Ok(true) 读到了；Ok(false) 开发版指定的仓库还没发过版本（404），
+/// 当成已是最新；蒜鸟自己的仓库 404 照旧算没查成
+fn release_found(status: u32, source: Source) -> Result<bool, String> {
+    match status {
+        200 => Ok(true),
+        404 if !source.official => Ok(false),
+        404 => Err("发布页上还没有版本信息".into()),
+        status => Err(format!("服务器返回 {status}")),
+    }
+}
+
+/// 看懂、核对一份 latest.json。test：测试时换了地址读的
+fn parse_manifest(body: &[u8], source: Source, test: bool) -> Result<Manifest, String> {
+    let mut manifest: Manifest = serde_json::from_slice(body).map_err(|_| "版本信息看不懂".to_string())?;
     // 只认 https 的下载地址；测试时换了地址才认本机的 http
-    let test = test_url().is_some();
     let url_ok = |url: &str| url.starts_with("https://") || (test && url.starts_with("http://"));
     if manifest.pc.version.trim().is_empty() || !url_ok(&manifest.pc.url) || manifest.pc.sha256.trim().len() != 64 {
         return Err("版本信息不完整".into());
     }
-    let mirror_ok = manifest.mirror.starts_with(MIRROR_PREFIX) || (test && url_ok(&manifest.mirror));
+    // 开发版指定的仓库：安装包只认那个仓库自己发布的（测试时照旧）
+    if !source.official && !test && !source.on_github(&manifest.pc.url, "releases/download/") {
+        return Err(format!("版本信息里的安装包不是 {} 发布的", source.repo));
+    }
+    // Gitee 镜像只有蒜鸟自己的仓库有（别的仓库照着 release.yml 发版，latest.json 里写的也是蒜鸟的 Gitee，不用）
+    let mirror_ok = source.official && (manifest.mirror.starts_with(MIRROR_PREFIX) || (test && url_ok(&manifest.mirror)));
     if !mirror_ok || !manifest.mirror.ends_with('/') {
         manifest.mirror.clear();
     }
@@ -597,6 +742,85 @@ mod tests {
 
     fn hex(text: &str) -> Vec<u8> {
         (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn default_source_unchanged() {
+        let source = Source::of(None);
+        assert!(source.official);
+        assert_eq!(source.manifest_urls(), vec![(GITEE_MANIFEST_URL.to_string(), true), (MANIFEST_URL.to_string(), false)]);
+        assert_eq!(source.releases_page(), RELEASES_PAGE);
+        assert_eq!(source.state_file(), "update.json");
+        assert!(source.on_github("https://github.com/drhhhao/SuanNIAO/releases/tag/pc0.7.7-android0.9.6", ""));
+        assert!(!source.on_github("https://github.com/someone/SuanNIAO/releases/tag/x", ""));
+        // 设成空的、写的就是蒜鸟自己的仓库：和不设一样
+        assert_eq!(Source::of(Some("")), source);
+        assert_eq!(Source::of(Some("drhhhao/suanniao")), source);
+        // 不设环境变量编译出来的就是蒜鸟自己的仓库；设了别的就是那个
+        match BUILD_REPO {
+            Some(repo) if !repo.is_empty() && !repo.eq_ignore_ascii_case(DEFAULT_REPO) => assert_eq!(custom_repo(), Some(repo)),
+            _ => {
+                assert_eq!(super::source(), source);
+                assert_eq!(custom_repo(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn other_repo_reads_only_its_github() {
+        let source = Source::of(Some("someone/SuanNIAO"));
+        assert!(!source.official);
+        assert_eq!(source.manifest_urls(), vec![("https://github.com/someone/SuanNIAO/releases/latest/download/latest.json".to_string(), false)]);
+        assert_eq!(source.releases_page(), "https://github.com/someone/SuanNIAO/releases/latest");
+        assert_eq!(source.state_file(), "update-someone-SuanNIAO.json");
+        assert!(source.on_github("https://github.com/Someone/suanniao/releases/tag/x", ""));
+        assert!(!source.on_github("https://github.com/drhhhao/SuanNIAO/releases/tag/x", ""));
+        assert!(!source.on_github("https://github.com/someone/SuanNIAO-x/releases/tag/x", ""));
+    }
+
+    #[test]
+    fn no_release_yet() {
+        let official = Source::of(None);
+        let other = Source::of(Some("someone/SuanNIAO"));
+        assert_eq!(release_found(200, official), Ok(true));
+        assert_eq!(release_found(200, other), Ok(true));
+        // 开发版指定的仓库还没发过版本：当成已是最新，不算没查成
+        assert_eq!(release_found(404, other), Ok(false));
+        // 蒜鸟自己的仓库照旧算没查成
+        assert_eq!(release_found(404, official), Err("发布页上还没有版本信息".to_string()));
+        assert!(release_found(403, other).is_err());
+        assert!(release_found(500, other).is_err());
+    }
+
+    #[test]
+    fn manifest_checks() {
+        let body = |url: &str, mirror: &str| {
+            serde_json::json!({"pc": {"version": "0.7.30", "url": url, "sha256": "a".repeat(64)}, "mirror": mirror}).to_string().into_bytes()
+        };
+        let gitee = "https://gitee.com/drhhhao_0/SuanNIAO/releases/download/pc0.7.30-android0.9.30/";
+        let own = "https://github.com/someone/SuanNIAO/releases/download/pc0.7.30-android0.9.30/SuanNIAO-PC-0.7.30-Setup.exe";
+        let official = Source::of(None);
+        let other = Source::of(Some("someone/SuanNIAO"));
+        // 蒜鸟自己的仓库照旧：https 的安装包都认，Gitee 镜像留着
+        assert_eq!(parse_manifest(&body(own, gitee), official, false).unwrap().mirror, gitee);
+        assert!(parse_manifest(&body("http://example.com/a.exe", ""), official, false).is_err());
+        // 别的仓库：不用 Gitee 镜像，安装包只认它自己发布的（大小写不一样也认）
+        assert_eq!(parse_manifest(&body(own, gitee), other, false).unwrap().mirror, "");
+        assert!(parse_manifest(&body(&own.replace("someone/SuanNIAO", "Someone/suanniao"), ""), other, false).is_ok());
+        assert!(parse_manifest(&body("https://github.com/drhhhao/SuanNIAO/releases/download/x/a.exe", gitee), other, false).is_err());
+        assert!(parse_manifest(&body("https://example.com/a.exe", ""), other, false).is_err());
+        // 测试时（换了地址读）照旧认本机的地址
+        assert!(parse_manifest(&body("http://127.0.0.1:8765/a.exe", ""), other, true).is_ok());
+    }
+
+    #[test]
+    fn repo_names() {
+        for good in ["drhhhao/SuanNIAO", "someone/SuanNIAO", "a-b_c.d/e.f"] {
+            assert!(repo_name_ok(good), "{good}");
+        }
+        for bad in ["", "SuanNIAO", "/SuanNIAO", "drhhhao/", "a/b/c", "https://github.com/drhhhao/SuanNIAO", " drhhhao/SuanNIAO", "drhhhao/Suan NIAO"] {
+            assert!(!repo_name_ok(bad), "{bad}");
+        }
     }
 
     #[test]

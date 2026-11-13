@@ -12,11 +12,13 @@
 //! 电脑 → 手机：hello（带 pc＝局域网的电脑编号）、pong、config（布局和参数，连上时和配置变化时发，带每次加一的 rev）、
 //!              layoutSaved（布局存好没有）、profile（切换了方案：from、to）、clip（电脑上复制的文字 s）、
 //!              clipImg / clipImgPart / clipImgEnd / clipImgCancel（电脑上复制的图片，分块发，见 clipsync）、
-//!              lan（局域网地址变了：pc、addrs、port、fp，手机更新记着的地址，见 lan.rs）、
-//!              fileAck / fileDone（收文件的进度和结果，从收到的那条连接回，见 filerecv）
+//!              lan（局域网地址变了：pc、addrs、port、fp，手机更新记着的地址；每条连着的连接都发，
+//!              电脑没网时 addrs 是空的，见 lan.rs）、
+//!              fileAck / fileDone（收文件的进度和结果，从收到的那条连接回，见 filerecv）、
+//!              keysReleased（电脑把按着的键都松开了：改配置、暂停、切方案、息屏、断线、看门狗、局域网断开，见 send_keys_released）
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -138,8 +140,84 @@ static SEND: Mutex<()> = Mutex::new(());
 /// 直通按住的键：每个手机按键按下时按着的键（松开时照这个松，中途改了配置也不会松错）。
 /// 所有连接共用一份：按下走蓝牙、松开走局域网（中途换了连接）也能松开
 static HOLDS: Mutex<Option<HashMap<String, (Vec<u16>, u64)>>> = Mutex::new(None);
+
+/// Alt+Tab chooser shared across LAN/Bluetooth connections from the paired phone.
+/// The key hold has its own deadline so losing the phone UI cannot stick Alt.
+struct TaskSwitchHold {
+    vks: Vec<u16>,
+    generation: u64,
+    token: u64,
+    deadline: Instant,
+}
+static TASK_SWITCH: Mutex<Option<TaskSwitchHold>> = Mutex::new(None);
+static NEXT_TASK_SWITCH: AtomicU64 = AtomicU64::new(1);
+const TASK_SWITCH_MAX_HOLD: Duration = Duration::from_secs(12);
+
+fn task_switch(action: &str) {
+    let mut state = TASK_SWITCH.lock().unwrap();
+    match action {
+        "begin" | "next" | "previous" => {
+            if state.is_none() {
+                let Some(vks) = input::key_codes(&["alt".to_string()]) else { return };
+                let generation = input::hold_keys(&vks);
+                let token = NEXT_TASK_SWITCH.fetch_add(1, Ordering::Relaxed);
+                *state = Some(TaskSwitchHold {
+                    vks, generation, token,
+                    deadline: Instant::now() + TASK_SWITCH_MAX_HOLD,
+                });
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_millis(300));
+                    let mut slot = TASK_SWITCH.lock().unwrap();
+                    match slot.as_ref() {
+                        Some(v) if v.token == token && Instant::now() >= v.deadline => {
+                            input::key("esc", &[]);
+                            if let Some(v) = slot.take() {
+                                input::release_keys(&v.vks, v.generation);
+                            }
+                            log!("⌨ Alt+Tab 超时，已取消并释放Alt");
+                            break;
+                        }
+                        Some(v) if v.token == token => {}
+                        _ => break,
+                    }
+                });
+            }
+            if let Some(v) = state.as_mut() {
+                v.deadline = Instant::now() + TASK_SWITCH_MAX_HOLD;
+            }
+            if action == "previous" {
+                input::key("tab", &["shift".to_string()]);
+            } else {
+                input::key("tab", &[]);
+            }
+        }
+        "commit" | "cancel" => {
+            if let Some(v) = state.take() {
+                if action == "cancel" {
+                    input::key("esc", &[]);
+                }
+                input::release_keys(&v.vks, v.generation);
+            }
+        }
+        _ => {}
+    }
+}
 /// 任意一条连接最近收到消息的时刻（看门狗：所有连接都没动静才松开按着的键）
 static LAST_RX: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// 收起切换应用：先按 Esc 取消（cancel，不切过去），再松开按着的 Alt。返回 true = 本来开着。
+/// Alt 已经被「全部松开」过（代数变了）就不按 Esc：那时面板早没了，Esc 会落到别的窗口上
+fn end_task_switch(cancel: bool) -> bool {
+    let Some(v) = TASK_SWITCH.lock().unwrap().take() else { return false };
+    if cancel && v.generation == input::hold_generation() {
+        input::key("esc", &[]);
+    }
+    input::release_keys(&v.vks, v.generation);
+    true
+}
+
+/// 画面上「按住」的左键是 screenPointer 按下的（局域网断了要替它抬起；触控板按的左键不归它管）
+static SCREEN_LEFT: AtomicBool = AtomicBool::new(false);
 
 /// 发消息用的连接，按顺序：局域网优先（快），然后蓝牙
 fn preferred_all() -> Vec<Conn> {
@@ -149,10 +227,52 @@ fn preferred_all() -> Vec<Conn> {
     list.into_iter().map(|l| l.conn.clone()).collect()
 }
 
-/// 松开所有按着的鼠标键、键盘键，并清掉直通记录
+/// 告诉手机：电脑这边把按着的键都松开了（K4）。手机收到就把键鼠条上锁着的修饰键、「按住」、切换应用的条都收起来
+/// （不再发松开）。不说的话手机上还显示「Ctrl ·锁」，用户以为按着 Ctrl 去点，结果是普通点击（审查 #12）。
+/// 一条连接都没有就发不出去：手机连上以后会自己发 release，电脑松开时再回这条
+fn send_keys_released() {
+    send_to_phone(&json!({"t": "keysReleased"}));
+}
+
+/// 松开所有按着的鼠标键、键盘键，并清掉直通、切换应用、键鼠条修饰键、画面按住左键的记录，然后告诉手机。
+/// 断线（一条连接都不剩）、息屏、手机发来 release、看门狗都走这里
 fn release_everything() {
     HOLDS.lock().unwrap().get_or_insert_with(HashMap::new).clear();
+    TASK_SWITCH.lock().unwrap().take();
+    SCREEN_LEFT.store(false, Ordering::Relaxed);
+    input::release_modifier_holds();
     input::release_all();
+    send_keys_released();
+}
+
+/// 只松开键盘键（改了配置、暂停、切了方案）：直通、键鼠条修饰键、切换应用按着的 Alt 都松开，鼠标键不动；然后告诉手机。
+/// 切换应用的记录也清掉：Alt 已经松开了，留着的话手机再点「下一个」只会按 Tab，12 秒后还会多按一下 Esc
+pub fn release_all_keys() {
+    TASK_SWITCH.lock().unwrap().take();
+    input::release_keys_all();
+    send_keys_released();
+}
+
+/// 局域网会话结束、蓝牙还连着时（K7，审查 #1）：只有局域网能按的东西替手机松开——键鼠条锁住的修饰键（mod）、
+/// 画面上按住的左键（screenPointer）、切换应用按着的 Alt（面板开在远程画面上）。不然 Wi-Fi 抖一下，
+/// 电脑上 Ctrl 或左键就一直按着，打字全成了 Ctrl+字母、动一下鼠标就是拖。直通的按键蓝牙也能按、能松，不动。
+/// 然后从还连着的那条告诉手机
+fn release_lan_holds() {
+    let mods = input::release_modifier_holds();
+    let left = SCREEN_LEFT.swap(false, Ordering::Relaxed);
+    if left {
+        input::button(input::Button::Left, "up");
+    }
+    let switching = end_task_switch(true);
+    if mods > 0 || left || switching {
+        log!(
+            "🔓 局域网断开，替手机松开了{}{}{}",
+            if mods > 0 { format!(" {mods} 个锁住的修饰键") } else { String::new() },
+            if left { " 画面上按住的左键" } else { "" },
+            if switching { " 切换应用按着的 Alt" } else { "" }
+        );
+    }
+    send_keys_released();
 }
 
 /// 别的手机正连着（编号不一样）：只看知道编号、而且编号还在绑定列表里的连接。
@@ -238,6 +358,26 @@ pub fn send_to_phone(value: &Value) -> bool {
         }
     }
     false
+}
+
+/// 发一条消息给每一条连着的连接（蓝牙、局域网都发），返回发出去了的连接（「蓝牙」「局域网」）。
+/// 电脑的局域网地址变了时用：局域网那条这时多半已经断了、电脑还不知道，消息写进去也到不了手机，所以蓝牙也要发。
+/// 先发蓝牙：局域网那条断了的话要等到写超时（最多 5 秒）。局域网写不出去就关掉它
+pub fn send_to_every_link(value: &Value) -> Vec<&'static str> {
+    let _guard = SEND.lock().unwrap();
+    let mut bytes = value.to_string().into_bytes();
+    bytes.push(b'\n');
+    let mut conns: Vec<Conn> = LINKS.lock().unwrap().iter().map(|l| l.conn.clone()).collect();
+    conns.sort_by_key(|c| if c.kind() == Kind::Bt { 0 } else { 1 });
+    let mut sent = Vec::new();
+    for conn in conns {
+        if conn.write(&bytes) {
+            sent.push(conn.kind().name());
+        } else if conn.kind() == Kind::Lan {
+            conn.close();
+        }
+    }
+    sent
 }
 
 /// 回复走收到请求的那条连接（hello、pong、mem、layoutSaved）：另一条可能已经断了，而这条肯定刚收到过东西
@@ -367,10 +507,12 @@ impl Session {
             (links.len() != before, link_codes(&links))
         };
         // 一条连接都不剩了：还没执行的动作不做了，按着的键都松开。
-        // 另一条还连着就不动：手机会从那条接着发（松开也从那条来），断的这条上按着的键不会卡住
+        // 另一条还连着：手机会从那条接着发（直通的松开也从那条来），只松开局域网才能按的那些（见 release_lan_holds）
         if LINKS.lock().unwrap().is_empty() {
             actions::cancel();
             release_everything();
+        } else if kind == Kind::Lan {
+            release_lan_holds();
         }
         if was_listed {
             if left.is_empty() {
@@ -443,7 +585,7 @@ impl Session {
         };
         let num = |k: &str| msg.get(k).and_then(Value::as_f64).unwrap_or(0.0);
         let text = |k: &str| msg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        if crate::trace::dry_run() && matches!(text("t").as_str(), "button" | "hold" | "key" | "text" | "layout" | "clip") {
+        if crate::trace::dry_run() && matches!(text("t").as_str(), "button" | "hold" | "key" | "taskSwitch" | "text" | "layout" | "clip") {
             crate::trace::event("skip", &[]);
             return true;
         }
@@ -527,6 +669,31 @@ impl Session {
                 self.note_move();
             }
             "scroll" => input::scroll(num("x").clamp(-12000.0, 12000.0) as i32, num("y").clamp(-12000.0, 12000.0) as i32),
+            "screenPointer" => {
+                // 只接受已认证局域网连接的画面坐标，拒绝超出主显示器的数字。
+                if conn.kind() == Kind::Lan {
+                    let point = match (msg.get("x").and_then(Value::as_i64), msg.get("y").and_then(Value::as_i64)) {
+                        (Some(x), Some(y)) if (0..=3840).contains(&x) && (0..=3840).contains(&y) => Some((x as i32, y as i32)),
+                        _ => None,
+                    };
+                    let moved = point.is_some_and(|(x, y)| input::move_absolute(x, y));
+                    match text("a").as_str() {
+                        "down" if moved => {
+                            SCREEN_LEFT.store(true, Ordering::Relaxed);
+                            input::button(input::Button::Left, "down");
+                        }
+                        // 抬起：自己按下的左键，坐标不对、挪不过去也要抬（按住期间电脑分辨率变了，坐标就出界了，
+                        // 以前这样就不抬，左键一直按着）
+                        "up" => {
+                            let ours = SCREEN_LEFT.swap(false, Ordering::Relaxed);
+                            if moved || ours {
+                                input::button(input::Button::Left, "up");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            },
             "mouse" => {
                 crate::trace::event("mouse", &[match text("a").as_str() { "down" => 1.0, "up" => 0.0, _ => 2.0 }]);
                 if let Some(button) = input::Button::parse(&text("b")) {
@@ -548,6 +715,67 @@ impl Session {
                 }
             }
             "layout" => save_layout(&msg, conn),
+            "screenWorkbenchLayout" => {
+                let result = msg.get("workbench")
+                    .ok_or("缺少工作台数据".to_owned())
+                    .and_then(state::save_screen_workbench);
+                if result.is_ok() { push_config(); }
+                let reply_msg = json!({"t": "screenWorkbenchSaved",
+                    "ok": result.is_ok(), "error": result.err().unwrap_or_default()});
+                if !reply(conn, &reply_msg) { send_to_phone(&reply_msg); }
+            }
+            "screenWorkbenchV2Layout" => {
+                let result = msg.get("workbench")
+                    .ok_or("缺少V2工作台数据".to_owned())
+                    .and_then(state::save_screen_workbench_v2);
+                if result.is_ok() { push_config(); }
+                let reply_msg = json!({"t": "screenWorkbenchV2Saved",
+                    "requestId": msg.get("requestId").and_then(Value::as_str).unwrap_or(""),
+                    "ok": result.is_ok(), "error": result.err().unwrap_or_default()});
+                if !reply(conn, &reply_msg) { send_to_phone(&reply_msg); }
+            }
+            "screenWorkbenchV3Layout" | "screenWorkbenchV3Reset" => {
+                let result = if text("t") == "screenWorkbenchV3Reset" {
+                    state::reset_workbench_v3()
+                } else {
+                    msg.get("workbench").ok_or("缺少工作台数据".to_owned())
+                        .and_then(state::save_screen_workbench_v3)
+                };
+                if result.is_ok() { push_config(); }
+                let reply_msg = json!({"t": "screenWorkbenchV3Saved",
+                    "requestId": msg.get("requestId").and_then(Value::as_str).unwrap_or(""),
+                    "ok": result.is_ok(), "error": result.err().unwrap_or_default()});
+                if !reply(conn, &reply_msg) { send_to_phone(&reply_msg); }
+            }
+            "mod" => {
+                // 键鼠条上的 Ctrl / Shift / Alt / Win：按下后一直按着，手机说松开才松；断线、看门狗会全部松开
+                if conn.kind() == Kind::Lan && !self.paused(&state::config()) {
+                    let down = msg.get("down").and_then(Value::as_bool).unwrap_or(false);
+                    if !input::modifier(&text("k"), down) {
+                        log!("⚠ 不认识的修饰键：{}", text("k"));
+                    }
+                }
+            }
+            "keyEditorSave" => {
+                // Only authenticated LAN peers may change mappings via this new editor.
+                // 操作有 create / edit（快捷键）、createText / editText / deleteText（常用文本），都由 key_editor 校验
+                let result = if conn.kind() == Kind::Lan {
+                    state::save_key_edit(&msg)
+                } else {
+                    Err("快捷键编辑需要已配对的局域网连接".into())
+                };
+                // 回执四个字段都带上：成功时 buttonId 是建好、改好或删掉的按键；失败时是请求里的（新建时没有）
+                let response = match result {
+                    Ok(id) => {
+                        push_config_on(Some(conn));
+                        json!({"t": "keyEditorSaved", "ok": true, "buttonId": id,
+                            "requestId": text("requestId"), "error": ""})
+                    }
+                    Err(error) => json!({"t": "keyEditorSaved", "ok": false, "buttonId": text("buttonId"),
+                        "requestId": text("requestId"), "error": error}),
+                };
+                if !reply(conn, &response) { send_to_phone(&response); }
+            }
             "configAck" => {
                 let rev = msg.get("rev").and_then(Value::as_u64).unwrap_or(0);
                 state::update_status(|s| {
@@ -567,6 +795,11 @@ impl Session {
                 state::update_status(|s| s.battery = Some(battery));
                 if changed {
                     log!("🔋 手机电量 {level}%{}", if charging { "，充电中" } else { "" });
+                }
+            }
+            "taskSwitch" => {
+                if !self.paused(&state::config()) {
+                    task_switch(&text("a"));
                 }
             }
             "key" => {
@@ -867,18 +1100,21 @@ const LAN_SILENT_LIMIT: Duration = Duration::from_secs(5);
 fn spawn_watchdog(watch: Arc<Mutex<Watch>>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
-        let state = watch.lock().unwrap();
-        if !state.alive {
-            return;
+        {
+            let state = watch.lock().unwrap();
+            if !state.alive {
+                return;
+            }
+            if !state.screen_on {
+                continue;
+            }
+            if state.conn.kind() == Kind::Lan && state.last_rx.elapsed() > LAN_SILENT_LIMIT {
+                log!("⏱ 局域网 {} 秒没收到手机消息，断开这条连接", LAN_SILENT_LIMIT.as_secs());
+                state.conn.close();
+                return;
+            }
         }
-        if !state.screen_on {
-            continue;
-        }
-        if state.conn.kind() == Kind::Lan && state.last_rx.elapsed() > LAN_SILENT_LIMIT {
-            log!("⏱ 局域网 {} 秒没收到手机消息，断开这条连接", LAN_SILENT_LIMIT.as_secs());
-            state.conn.close();
-            return;
-        }
+        // 松开时要给手机发消息（写连接可能慢）：先放开 watch，会话线程每收一条消息都要用它
         let quiet = LAST_RX.lock().unwrap().is_none_or(|t| t.elapsed() > Duration::from_secs(10));
         if quiet && input::any_held() {
             release_everything();

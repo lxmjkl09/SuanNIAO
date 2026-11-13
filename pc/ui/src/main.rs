@@ -7,9 +7,11 @@
 //! 首页每秒读一次后台写的 status.json，显示手机连接状态、同步回执。
 //! 设置页可以导入遥控器映射（读本机的数据或它导出的文件，只读不写），先预览勾选，再新建一页「遥控器」。
 //! 多套方案、撤销重做、复制粘贴动作、预设、已保存的序列、录按键、导出导入在 tools.rs；撤销的记录在 history.rs。
+//! 布局页的「远程工作台」标签（手机进「电脑屏幕」全屏时用的按钮放什么、什么顺序）在 workbench.rs。
 //! 检查更新在 update.rs；安装、卸载（`--setup` / `--uninstall`，安装包运行的）在 setup.rs。
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Dev builds also run independently of a console; diagnostics remain in log files.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod history;
 mod lan;
@@ -17,6 +19,7 @@ mod setup;
 mod tools;
 mod update;
 mod win;
+mod workbench;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
@@ -34,6 +37,7 @@ use suanniao_config::{
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 slint::include_modules!();
 
@@ -49,6 +53,8 @@ struct App {
     page: usize,
     /// 布局页选中的模块（当前页里的下标）
     selected: Option<usize>,
+    /// 布局页在看「远程工作台」标签（不看哪一页的手机画面），见 workbench.rs
+    workbench: bool,
     /// 映射页选中的按键（在所有按键里的下标）
     map_index: usize,
     map_trigger: Trigger,
@@ -123,6 +129,8 @@ struct Ctx {
     autostart_asked: Cell<bool>,
     /// 局域网连接：二维码弹窗、绑定过的手机
     lan: RefCell<lan::LanUi>,
+    /// 布局页「远程工作台」标签上的按钮
+    wb: workbench::Models,
 }
 
 thread_local! {
@@ -242,7 +250,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let synced = Synced { text, base: loaded.clone(), mtime: config_mtime() };
     let ctx = Rc::new(Ctx {
         ui: ui.as_weak(),
-        app: RefCell::new(App { config: loaded, page: 0, selected: None, map_index: 0, map_trigger: Trigger::Click }),
+        app: RefCell::new(App { config: loaded, page: 0, selected: None, workbench: false, map_index: 0, map_trigger: Trigger::Click }),
         synced: RefCell::new(synced),
         save_timer: Timer::default(),
         dirty: Cell::new(false),
@@ -267,10 +275,12 @@ fn main() -> Result<(), slint::PlatformError> {
         bluetooth_busy: Cell::new(false),
         autostart_asked: Cell::new(ui_flag("autostartAsked")),
         lan: RefCell::new(lan::LanUi::default()),
+        wb: workbench::Models::default(),
     });
     CTX.with(|c| *c.borrow_mut() = Some(ctx.clone()));
     ui.set_recent(ModelRc::from(ctx.recent.clone()));
     ui.set_modules(ModelRc::from(ctx.modules.clone()));
+    ctx.wb.bind(&ui);
     // 教程里写的电脑名字：先用计算机名，查到蓝牙以后换成蓝牙里的名字（一般就是计算机名）
     if let Some(name) = std::env::var("COMPUTERNAME").ok().filter(|n| !n.trim().is_empty()) {
         ui.set_computer_name(name.trim().into());
@@ -475,6 +485,25 @@ fn wire(ui: &AppWindow, ctx: &Rc<Ctx>) {
     bind!(on_sel_hold_changed, |i| sel_hold_changed);
     bind!(on_hold_blocked, | | hold_blocked);
     bind!(on_edit_mapping, | | edit_mapping);
+    bind!(on_open_workbench, | | open_workbench);
+    bind!(on_wb_create, | | wb_create);
+    bind!(on_wb_menu, |p, i| wb_menu);
+    bind!(on_wb_library, |p, i| wb_library);
+    bind!(on_wb_act, |p, i, t, a| wb_act);
+    bind!(on_wb_hotkey_save, |n, c, f, m| wb_hotkey_save);
+    bind!(on_wb_text_save, |n, t, e| wb_text_save);
+    bind!(on_wb_new_cancel, | | wb_new_cancel);
+    bind!(on_wb_combo_problem, |c| wb_combo_problem);
+    bind!(on_wb_combo_main, |c| wb_combo_main);
+    bind!(on_wb_combo_pick, |c, k| wb_combo_pick);
+    // 远程工作台里拖按钮：松手前问能不能放（画插入线、红色提示），松手时放
+    {
+        let drag = ui.global::<WbDrag>();
+        let check = ctx.clone();
+        drag.on_check(move |fp, fi, t, tp, ti| check.wb_drop_check(fp, fi, t, tp, ti));
+        let dropped = ctx.clone();
+        drag.on_drop_at(move |fp, fi, t, tp, ti| dropped.wb_drop(fp, fi, t, tp, ti));
+    }
     bind!(on_map_hold_changed, |i| map_hold_changed);
     bind!(on_select_button, |i| select_button);
     bind!(on_toggle_page, |i| toggle_page);
@@ -552,6 +581,98 @@ fn button_refs(config: &Config) -> Vec<(usize, usize)> {
         .collect()
 }
 
+// ───────── 布局页的页面标签：工作台专用页不显示（K1） ─────────
+
+/// 布局页的页面标签列哪些页，返回在 config.layout.pages 里的下标。工作台专用页藏起来：
+/// 用户会把它当成多出来的一页删掉，悬浮球、键鼠条上的热键就跟着没了（见 workbench::is_storage_page）。
+/// 万一只剩专用页（正常用不会这样），就照常列出来，免得一页都没有
+fn visible_pages(config: &Config) -> Vec<usize> {
+    let pages = &config.layout.pages;
+    let shown: Vec<usize> = (0..pages.len()).filter(|&i| !config::workbench::is_storage_page(&pages[i])).collect();
+    if shown.is_empty() {
+        (0..pages.len()).collect()
+    } else {
+        shown
+    }
+}
+
+/// 布局页正在看的页要是看不到（专用页，或者删页、撤销以后越界了）：换成后面最近的一页，后面没有就往前找
+fn shown_page(config: &Config, page: usize) -> usize {
+    let visible = visible_pages(config);
+    if visible.contains(&page) {
+        return page;
+    }
+    visible.iter().copied().find(|&i| i > page).or_else(|| visible.iter().copied().rev().find(|&i| i < page)).unwrap_or(0)
+}
+
+/// 页面在映射页列表、标题里叫什么：工作台专用页写「远程工作台」（布局页看不到这一页，免得找不到）
+fn page_title(page: &Page) -> String {
+    if config::workbench::is_storage_page(page) {
+        "远程工作台".to_string()
+    } else {
+        page.name.clone()
+    }
+}
+
+// ───────── 电脑屏幕模块按画面比例定高（K6） ─────────
+
+/// 布局页手机画面里一格的宽 ÷ 高。和 app.slint 的 LayoutPage 一样算：手机外壳 306 × 632，画布左右各缩进 14、上下各缩进 18
+fn preview_cell_aspect(columns: f64, rows: f64) -> f64 {
+    ((306.0 - 28.0) / columns.max(1.0)) / ((632.0 - 36.0) / rows.max(1.0))
+}
+
+/// 电脑主显示器的宽、高（像素）；拿不到就当 16:9
+fn desktop_size() -> (f64, f64) {
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    if w > 0 && h > 0 {
+        (w as f64, h as f64)
+    } else {
+        (16.0, 9.0)
+    }
+}
+
+/// 电脑屏幕模块 1 格宽要配多少格高：格子的宽高比 × 桌面的高宽比，画面放进去上下不留白
+fn screen_ratio(columns: f64, rows: f64, desktop: (f64, f64)) -> f64 {
+    preview_cell_aspect(columns, rows) * desktop.1 / desktop.0
+}
+
+/// 这台电脑、现在的网格下的比例
+fn config_screen_ratio(config: &Config) -> f64 {
+    let (columns, rows) = config.grid();
+    screen_ratio(columns, rows, desktop_size())
+}
+
+/// 按宽算高：取到 1/4 格（snap = false，也就是按住 Alt 拖时，取到 0.01 格），不小于最小尺寸
+fn screen_height(w: f64, ratio: f64, snap: bool) -> f64 {
+    geometry::snap_to(w * ratio, snap).max(MIN_SIZE)
+}
+
+/// 电脑屏幕模块改了大小：按画面比例定高。want 是按鼠标（或输入的数）算出来的样子，start 是原来的，edges 是动的边：
+/// - 宽变了（拖左右边、四个角，输宽）：高跟着宽走；
+/// - 只动了高（拖上下边，输高）：按高反算宽（取到 1/4 格），再按宽定高，保持比例；
+/// - 拖了上边就下边不动，否则上边不动；拖了左边就右边不动，否则左边不动。
+///
+/// 放不下（出界、压到别的模块）就一点点缩小，直到放得下；缩到最小还放不下返回 None
+#[allow(clippy::too_many_arguments)]
+fn fit_screen(config: &Config, page: usize, index: usize, start: Rect, want: Rect, edges: u8, snap: bool, ratio: f64) -> Option<Rect> {
+    let (columns, _) = config.grid();
+    let by_width = edges & (geometry::LEFT | geometry::RIGHT) != 0;
+    let mut w = if by_width { want.w } else { geometry::snap_to(want.h / ratio, snap) };
+    w = w.min(columns).max(MIN_SIZE);
+    let step = if snap { geometry::SNAP } else { 0.01 };
+    while w >= MIN_SIZE - geometry::EPS {
+        let h = screen_height(w, ratio, snap);
+        let x = if edges & geometry::LEFT != 0 { start.right() - w } else { start.x };
+        let y = if edges & geometry::TOP != 0 { start.bottom() - h } else { start.y };
+        let rect = Rect::new(x, y, w, h).tidy();
+        if config.fits(page, Some(index), rect) {
+            return Some(rect);
+        }
+        w = geometry::fine(w - step);
+    }
+    None
+}
+
 // ───────── 按键的图标 ─────────
 
 /// 按键的图标按动作挑（不看键上写的字）：（图标名，没有合适图标时写的两三个字，颜色）。
@@ -561,6 +682,7 @@ fn tile(module: &Module) -> (&'static str, String, i32) {
         ModuleKind::Touchpad => ("pad", String::new(), 0),
         ModuleKind::VoiceButton => ("mic", String::new(), 1),
         ModuleKind::Voice => ("text", String::new(), 0),
+        ModuleKind::Screen => ("screen", String::new(), 0),
         ModuleKind::Button => steps_tile(&module.behaviors.click),
     }
 }
@@ -900,6 +1022,11 @@ impl Ctx {
         }
         // 新加的步骤补 id、repeat 跟着「按住时」写（旧版也读得懂连发）
         self.app.borrow_mut().config.normalize();
+        // 删掉了被远程工作台用着的按键：不拦着，工作台里指向它的引用跟着拿掉（悬浮球那格变空，各排里去掉），照常保存。
+        // 撤销删按键时，引用随撤销记录里的配置一起回来
+        if config::workbench::prune_missing(&mut self.app.borrow_mut().config) {
+            self.refresh_workbench();
+        }
         let config = self.app.borrow().config.clone();
         let text = config::to_text(&config);
         match config::write_json(&config::config_path(), &text) {
@@ -1056,7 +1183,9 @@ impl Ctx {
         let (items, home, home_name) = {
             let app = self.app.borrow();
             let pages = &app.config.layout.pages;
-            (Self::module_items(&pages[app.page]), Self::module_items(&pages[0]), pages[0].name.clone())
+            // 首页卡片看的「主页」是能看到的第一页（工作台专用页不算）
+            let first = &pages[visible_pages(&app.config)[0]];
+            (Self::module_items(&pages[app.page]), Self::module_items(first), first.name.clone())
         };
         sync_rows(&self.modules, items);
         // 首页的「手机布局」卡片看第一页（主页），不跟着布局页正在看的那页走
@@ -1066,31 +1195,38 @@ impl Ctx {
         }
     }
 
+    /// 布局页的页面标签：只列能看到的页（工作台专用页不列），侧边栏「布局 N 页」也就不算它
     fn refresh_page_names(&self) {
         let Some(ui) = self.ui() else { return };
-        let names: Vec<String> = self.app.borrow().config.layout.pages.iter().map(|p| p.name.clone()).collect();
+        let names: Vec<String> = {
+            let app = self.app.borrow();
+            visible_pages(&app.config).into_iter().map(|i| app.config.layout.pages[i].name.clone()).collect()
+        };
         ui.set_page_names(strings(names.iter().map(String::as_str)));
     }
 
     fn refresh_layout(&self) {
         let Some(ui) = self.ui() else { return };
-        let (page, page_name, columns, rows, selected) = {
+        let (tab, page_name, columns, rows, selected) = {
             let mut app = self.app.borrow_mut();
-            app.page = app.page.min(app.config.layout.pages.len() - 1);
+            // app.page 是在 config.layout.pages 里的下标；界面上的标签只列能看到的页，选中的是第 tab 个
+            app.page = shown_page(&app.config, app.page);
+            let tab = visible_pages(&app.config).iter().position(|&i| i == app.page).unwrap_or(0);
             let page = &app.config.layout.pages[app.page];
             let selected = app.selected.and_then(|i| page.modules.get(i).map(|m| (i, m.clone())));
-            let result = (app.page, page.name.clone(), app.config.layout.columns, app.config.layout.rows, selected.clone());
+            let result = (tab, page.name.clone(), app.config.layout.columns, app.config.layout.rows, selected.clone());
             if selected.is_none() {
                 app.selected = None;
             }
             result
         };
         self.refresh_page_names();
-        ui.set_page_index(page as i32);
+        ui.set_page_index(tab as i32);
         ui.set_page_name(page_name.into());
         ui.set_columns(columns as i32);
         ui.set_rows(rows as i32);
         self.refresh_canvas();
+        self.refresh_workbench();
         match selected {
             Some((i, m)) => {
                 ui.set_sel_kind(kind_index(m.kind));
@@ -1147,7 +1283,7 @@ impl Ctx {
                     let module = &app.config.layout.pages[pi].modules[mi];
                     let profiles = app.config.profiles.len();
                     let items: Vec<ActionItem> = module.behaviors.get(app.map_trigger).iter().map(|s| action_item(s, profiles)).collect();
-                    let page = if multi { app.config.layout.pages[pi].name.clone() } else { String::new() };
+                    let page = if multi { page_title(&app.config.layout.pages[pi]) } else { String::new() };
                     (format!("{} · {}", module.title(), app.map_trigger.name()), page, items)
                 }
                 None => (String::new(), String::new(), Vec::new()),
@@ -1215,7 +1351,7 @@ impl Ctx {
                 if multi || !query.is_empty() {
                     rows.push(MapRow {
                         header: true,
-                        text: page.name.as_str().into(),
+                        text: page_title(page).into(),
                         index: pi as i32,
                         collapsed: folded,
                         count: items.len() as i32,
@@ -1609,18 +1745,21 @@ impl Ctx {
 
     // ───────── 布局 ─────────
 
+    /// 点了第几个页面标签（在看「远程工作台」时就回到这一页）。标签只列能看到的页，换回 config.layout.pages 的下标
     fn select_page(self: &Rc<Self>, index: i32) {
         {
             let mut app = self.app.borrow_mut();
-            app.page = (index.max(0) as usize).min(app.config.layout.pages.len() - 1);
+            let visible = visible_pages(&app.config);
+            app.page = visible.get(index.max(0) as usize).or(visible.last()).copied().unwrap_or(0);
             app.selected = None;
+            app.workbench = false;
         }
         self.refresh_layout();
     }
 
-    /// 新页面的名字：「第 N 页」，重名就往后数
+    /// 新页面的名字：「第 N 页」（N 按能看到的页数，工作台专用页不算），重名就往后数
     fn new_page_name(config: &Config) -> String {
-        (config.layout.pages.len() + 1..).map(|n| format!("第 {n} 页")).find(|n| !config.layout.pages.iter().any(|p| &p.name == n)).unwrap()
+        (visible_pages(config).len() + 1..).map(|n| format!("第 {n} 页")).find(|n| !config.layout.pages.iter().any(|p| &p.name == n)).unwrap()
     }
 
     fn add_page(self: &Rc<Self>) {
@@ -1632,6 +1771,7 @@ impl Ctx {
             app.config.layout.pages.push(Page { id, name, modules: Vec::new() });
             app.page = app.config.layout.pages.len() - 1;
             app.selected = None;
+            app.workbench = false;
         }
         self.changed();
     }
@@ -1653,12 +1793,19 @@ impl Ctx {
 
     /// 删除这一页：有模块时先确认（写明有几个模块、几个方案里的映射会一起删），删完可以撤销
     fn delete_page(self: &Rc<Self>) {
-        let (page_id, name, count, buttons, pages) = {
+        let (page_id, name, count, buttons, pages, storage) = {
             let app = self.app.borrow();
             let page = &app.config.layout.pages[app.page];
             let buttons: Vec<String> = page.modules.iter().filter(|m| m.kind == ModuleKind::Button).map(|m| m.id.clone()).collect();
-            (page.id.clone(), page.name.clone(), page.modules.len(), buttons, app.config.layout.pages.len())
+            let storage = config::workbench::is_storage_page(page);
+            (page.id.clone(), page.name.clone(), page.modules.len(), buttons, visible_pages(&app.config).len(), storage)
         };
+        // 工作台专用页不在标签里，正常删不到；万一删到了也不删（工作台的热键都在上面）
+        if storage {
+            self.toast("这一页放的是远程工作台的按键：在「远程工作台」里拿掉不用的就行");
+            return;
+        }
+        // 「至少一页」只算能看到的页
         if pages <= 1 {
             self.toast("至少要留一页");
             return;
@@ -1691,12 +1838,13 @@ impl Ctx {
         self.checkpoint(None, &format!("删除页面「{name}」"));
         {
             let mut app = self.app.borrow_mut();
-            if app.config.layout.pages.len() <= 1 {
+            if visible_pages(&app.config).len() <= 1 {
                 return;
             }
             if let Some(index) = app.config.layout.pages.iter().position(|p| p.id == page_id) {
                 app.config.layout.pages.remove(index);
-                app.page = index.min(app.config.layout.pages.len() - 1);
+                // 落到工作台专用页上（它不显示）时，refresh_layout 会换成旁边能看到的那一页
+                app.page = shown_page(&app.config, index.min(app.config.layout.pages.len() - 1));
             }
             app.selected = None;
         }
@@ -1716,11 +1864,15 @@ impl Ctx {
     fn grid_problem(self: &Rc<Self>, columns: i32, rows: i32) -> SharedString {
         let app = self.app.borrow();
         let (c, r) = (columns.clamp(2, 8) as f64, rows.clamp(3, 16) as f64);
-        let outside = app.config.layout.pages.iter().flat_map(|p| p.modules.iter()).find(|m| {
+        // 工作台专用页不显示，上面的按键用户挪不了：出了网格就自动重新排（见 grid_apply），只有多到排不下才说
+        let outside = app.config.layout.pages.iter().filter(|p| !config::workbench::is_storage_page(p)).flat_map(|p| p.modules.iter()).find(|m| {
             m.rect().right() > c + geometry::EPS || m.rect().bottom() > r + geometry::EPS
         });
         match outside {
             Some(m) => format!("「{}」会超出 {columns} 列 × {rows} 行：先把它挪进来或改小", m.title()).into(),
+            None if !workbench::storage_fits(&app.config, c, r) => {
+                format!("远程工作台的按键太多，{columns} 列 × {rows} 行放不下：先在「远程工作台」里拿掉几个").into()
+            }
             None => SharedString::new(),
         }
     }
@@ -1735,6 +1887,8 @@ impl Ctx {
             let mut app = self.app.borrow_mut();
             app.config.layout.columns = columns;
             app.config.layout.rows = rows;
+            // 工作台专用页上出了网格的按键重新排进来（这一页不显示，位置没人看），和改网格是同一步撤销
+            workbench::fit_storage_to_grid(&mut app.config);
         }
         self.grid_close();
         self.changed();
@@ -1811,6 +1965,22 @@ impl Ctx {
         let others = app.config.others(page, Some(index as usize));
         let edges = edges.clamp(0, 15) as u8;
         let (rect, ok) = geometry::drag(module.rect(), edges, dx as f64, dy as f64, !free, &others, columns, rows);
+        // 电脑屏幕改大小：高跟着宽走，保持电脑画面的比例（单拖上下边时宽跟着高走），按住 Alt 时只是不对齐 1/4 格
+        if edges != 0 && module.kind == ModuleKind::Screen {
+            let ratio = config_screen_ratio(&app.config);
+            let fitted = fit_screen(&app.config, page, index as usize, module.rect(), rect, edges, !free, ratio);
+            let shown = fitted.unwrap_or(rect);
+            let label = format!("宽 {} × 高 {} · 按电脑画面比例", show(shown.w), show(shown.h));
+            return Ghost {
+                x: shown.x as f32,
+                y: shown.y as f32,
+                w: shown.w as f32,
+                h: shown.h as f32,
+                ok: fitted.is_some(),
+                label: label.into(),
+                moved: ModelRc::default(),
+            };
+        }
         if edges == 0 && !ok {
             if let Some(plan) = swap_plan(&app.config, page, index as usize, rect) {
                 let modules = &app.config.layout.pages[page].modules;
@@ -1845,38 +2015,74 @@ impl Ctx {
     fn rect_changed(self: &Rc<Self>, x: f32, y: f32, w: f32, h: f32) {
         let selected = self.app.borrow().selected;
         if let Some(index) = selected {
-            self.place(index, Rect::new(x as f64, y as f64, w as f64, h as f64));
+            let want = Rect::new(x as f64, y as f64, w as f64, h as f64);
+            self.place(index, self.screen_fit(index, want).unwrap_or(want));
         }
+    }
+
+    /// 电脑屏幕模块在属性面板里改了宽或高：另一个按电脑画面比例跟着定好（K6；放不下就缩小到放得下）。
+    /// 不是电脑屏幕、没改大小、怎么都放不下返回 None
+    fn screen_fit(&self, index: usize, want: Rect) -> Option<Rect> {
+        let app = self.app.borrow();
+        let page = app.page;
+        let start = app.config.layout.pages[page].modules.get(index).filter(|m| m.kind == ModuleKind::Screen)?.rect();
+        let edges = if (want.w - start.w).abs() > geometry::EPS {
+            geometry::RIGHT
+        } else if (want.h - start.h).abs() > geometry::EPS {
+            geometry::BOTTOM
+        } else {
+            return None;
+        };
+        // 一次只改一个数：左、上照输入框里的
+        let start = Rect { x: want.x, y: want.y, ..start };
+        fit_screen(&app.config, page, index, start, want, edges, true, config_screen_ratio(&app.config))
     }
 
     /// 属性面板里的加减：走到下一个 1/4 格。field 0 左、1 上、2 宽、3 高
     fn nudge(self: &Rc<Self>, field: i32, dir: i32) {
         let selected = self.app.borrow().selected;
         let Some((index, mut rect)) = selected.and_then(|i| self.current_rect(i).map(|r| (i, r))) else { return };
+        let screen = {
+            let app = self.app.borrow();
+            app.config.layout.pages[app.page].modules.get(index).is_some_and(|m| m.kind == ModuleKind::Screen)
+        };
         match field {
             0 => rect.x = geometry::step(rect.x, dir),
             1 => rect.y = geometry::step(rect.y, dir),
+            // 电脑屏幕的宽、高按画面比例一起变：加减高也是一格一格地改宽，高跟着走
+            2 | 3 if screen => rect.w = geometry::step(rect.w, dir).max(MIN_SIZE),
             2 => rect.w = geometry::step(rect.w, dir).max(MIN_SIZE),
             _ => rect.h = geometry::step(rect.h, dir).max(MIN_SIZE),
         }
+        let rect = if screen { self.screen_fit(index, rect).unwrap_or(rect) } else { rect };
         self.place(index, rect);
     }
 
-    /// 添加模块：放在这一页第一个空位（放不下原来的大小就试小一点的）；这一页满了就新建一页放进去
+    /// 添加模块：放在这一页第一个空位（放不下原来的大小就试小一点的）；这一页满了就新建一页放进去。
+    /// 「这一页」一定是能看到的页（工作台专用页不显示，free_spot 也不往里放）
     fn add_module(self: &Rc<Self>, kind: i32) {
-        let kind = ModuleKind::ALL[kind.clamp(0, 3) as usize];
+        let kind = ModuleKind::ALL[kind.clamp(0, (ModuleKind::ALL.len() - 1) as i32) as usize];
         self.checkpoint(None, &format!("添加{}", kind.name()));
         let new_page = {
             let mut app = self.app.borrow_mut();
             let columns = app.config.layout.columns;
+            // 电脑屏幕：宽 min(列数, 4)，高按电脑画面比例算（4 列 8 行、16:9 的屏幕大约 4 × 2），不在格子里留一大片空白
+            let ratio = config_screen_ratio(&app.config);
             let (w, h) = match kind {
                 ModuleKind::Button => (1.0, 1.0),
                 ModuleKind::Touchpad => (2.0, 2.0),
                 ModuleKind::Voice => (columns.min(4) as f64, 2.0),
                 ModuleKind::VoiceButton => (columns.min(2) as f64, 1.0),
+                ModuleKind::Screen => (columns.min(4) as f64, screen_height(columns.min(4) as f64, ratio, true)),
+            };
+            // 放不下原来的大小：电脑屏幕按比例一点点缩小，别的试 1 × 1、最小
+            let sizes: Vec<(f64, f64)> = if kind == ModuleKind::Screen {
+                (0..).map(|k| w - k as f64 * geometry::SNAP).take_while(|w| *w >= MIN_SIZE - geometry::EPS).map(|w| (w, screen_height(w, ratio, true))).collect()
+            } else {
+                vec![(w, h), (1.0, 1.0), (MIN_SIZE, MIN_SIZE)]
             };
             let page = app.page;
-            let spot = [(w, h), (1.0, 1.0), (MIN_SIZE, MIN_SIZE)].into_iter().find_map(|(w, h)| app.config.free_spot(page, w, h).map(|(x, y)| (x, y, w, h)));
+            let spot = sizes.into_iter().find_map(|(w, h)| app.config.free_spot(page, w, h).map(|(x, y)| (x, y, w, h)));
             let (page, (x, y, w, h), new_page) = match spot {
                 Some(spot) => (page, spot, None),
                 None => {
@@ -1891,6 +2097,8 @@ impl Ctx {
             app.config.layout.pages[page].modules.push(Module { id, kind, label, x, y, w, h, ..Default::default() });
             app.page = page;
             app.selected = Some(app.config.layout.pages[page].modules.len() - 1);
+            // 在看「远程工作台」时从顶栏「添加按键」：切回这一页，看得到新加的模块
+            app.workbench = false;
             new_page
         };
         self.changed();
@@ -1944,7 +2152,7 @@ impl Ctx {
 
     /// 改模块类型：名字留着（按键改成触控板再改回来，还是原来的名字）
     fn kind_changed(self: &Rc<Self>, kind: i32) {
-        let kind = ModuleKind::ALL[kind.clamp(0, 3) as usize];
+        let kind = ModuleKind::ALL[kind.clamp(0, (ModuleKind::ALL.len() - 1) as i32) as usize];
         let title = {
             let app = self.app.borrow();
             app.selected.and_then(|i| app.config.layout.pages[app.page].modules.get(i)).map(Module::title)
@@ -2520,6 +2728,7 @@ impl Ctx {
                     };
                     app.page = app.config.layout.pages.len() - 1;
                     app.selected = None;
+                    app.workbench = false;
                     switched
                 };
                 *self.pending.borrow_mut() = None;
@@ -2636,5 +2845,94 @@ impl Ctx {
         if let Some(ui) = self.ui() {
             ui.set_autostart(win::autostart_enabled());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(id: &str, name: &str) -> Page {
+        Page { id: id.into(), name: name.into(), modules: Vec::new() }
+    }
+
+    /// K1：布局页的标签不列工作台专用页，下标换来换去都对得上
+    #[test]
+    fn layout_tabs_skip_the_storage_page() {
+        let mut config = Config::fresh();
+        config::workbench::ensure(&mut config);
+        assert_eq!(config.layout.pages[1].id, config::workbench::SHORTCUT_PAGE);
+        assert_eq!(visible_pages(&config), [0]);
+        // 新页面排在专用页后面：标签上是第 2 个，名字也按看得到的页数起
+        assert_eq!(Ctx::new_page_name(&config), "第 2 页");
+        config.layout.pages.push(page("page-9", "第 2 页"));
+        config.layout.pages.push(page("page-10", "第 3 页"));
+        assert_eq!(visible_pages(&config), [0, 2, 3]);
+        assert_eq!(Ctx::new_page_name(&config), "第 4 页");
+        // 正在看的页落到专用页上（删页、撤销以后）：换成后面那一页，后面没有就往前找
+        assert_eq!(shown_page(&config, 1), 2);
+        assert_eq!(shown_page(&config, 3), 3);
+        assert_eq!(shown_page(&config, 9), 3);
+        config.layout.pages.truncate(2);
+        assert_eq!(shown_page(&config, 1), 0);
+        // 映射页里专用页写成「远程工作台」
+        assert_eq!(page_title(&config.layout.pages[1]), "远程工作台");
+        assert_eq!(page_title(&config.layout.pages[0]), "主页");
+        // 只剩专用页（不该发生）：照常列出来
+        config.layout.pages.remove(0);
+        assert_eq!(visible_pages(&config), [0]);
+    }
+
+    /// K6：电脑屏幕的高 = 宽 × 格子宽高比 × 桌面高宽比，取到 1/4 格、不小于最小尺寸
+    #[test]
+    fn screen_height_follows_the_desktop_ratio() {
+        let ratio = screen_ratio(4.0, 8.0, (1920.0, 1080.0));
+        // 4 列 8 行的格子宽高比是 278×8 / (596×4)
+        assert!((preview_cell_aspect(4.0, 8.0) - 2224.0 / 2384.0).abs() < 1e-9);
+        assert_eq!(screen_height(4.0, ratio, true), 2.0);
+        assert_eq!(screen_height(3.0, ratio, true), 1.5);
+        assert_eq!(screen_height(0.5, ratio, true), MIN_SIZE);
+        assert_eq!(screen_height(4.0, ratio, false), 2.1);
+        // 竖着的屏幕、格子多：高跟着变大
+        assert!(screen_height(2.0, screen_ratio(4.0, 8.0, (1080.0, 1920.0)), true) > 3.0);
+    }
+
+    /// K6：拖宽高跟着走；只拖高宽跟着走；压到别的模块就缩小到放得下；上边、左边拖的时候对边不动
+    #[test]
+    fn screen_resize_keeps_the_ratio() {
+        let mut config = Config::fresh();
+        let ratio = screen_ratio(4.0, 8.0, (1920.0, 1080.0));
+        let screen = Module { id: "screen-1".into(), kind: ModuleKind::Screen, label: "电脑屏幕".into(), x: 0.0, y: 0.0, w: 4.0, h: 2.0, ..Default::default() };
+        config.layout.pages = vec![Page { id: "main".into(), name: "主页".into(), modules: vec![screen] }];
+        let start = Rect::new(0.0, 0.0, 4.0, 2.0);
+        // 拖右边改成 3 格宽：高变成 1.5
+        let r = fit_screen(&config, 0, 0, start, Rect::new(0.0, 0.0, 3.0, 2.0), geometry::RIGHT, true, ratio).unwrap();
+        assert_eq!(r, Rect::new(0.0, 0.0, 3.0, 1.5));
+        // 拖左边：右边不动
+        let r = fit_screen(&config, 0, 0, start, Rect::new(2.0, 0.0, 2.0, 2.0), geometry::LEFT, true, ratio).unwrap();
+        assert_eq!(r, Rect::new(2.0, 0.0, 2.0, 1.0));
+        // 只拖下边到 1 格高：宽按高反算（约 1.9 格，取到 2），再按宽定高
+        let r = fit_screen(&config, 0, 0, start, Rect::new(0.0, 0.0, 4.0, 1.0), geometry::BOTTOM, true, ratio).unwrap();
+        assert_eq!(r, Rect::new(0.0, 0.0, 2.0, 1.0));
+        // 下面有模块挡着：缩小到放得下
+        let mut blocked = config.clone();
+        blocked.layout.pages[0].modules[0].set_rect(Rect::new(0.0, 0.0, 2.0, 1.0));
+        blocked.layout.pages[0].modules.push(Module { id: "b".into(), kind: ModuleKind::Button, x: 0.0, y: 1.5, w: 1.0, h: 1.0, ..Default::default() });
+        let r = fit_screen(&blocked, 0, 0, Rect::new(0.0, 0.0, 2.0, 1.0), Rect::new(0.0, 0.0, 4.0, 1.0), geometry::RIGHT, true, ratio).unwrap();
+        assert_eq!(r, Rect::new(0.0, 0.0, 3.0, 1.5));
+        // 拖上边：下边不动
+        let mut low = config.clone();
+        low.layout.pages[0].modules[0].set_rect(Rect::new(0.0, 4.0, 2.0, 1.0));
+        let r = fit_screen(&low, 0, 0, Rect::new(0.0, 4.0, 2.0, 1.0), Rect::new(0.0, 2.0, 2.0, 3.0), geometry::TOP, true, ratio).unwrap();
+        assert_eq!((r.bottom(), r.h), (5.0, screen_height(r.w, ratio, true)));
+        // 挤得只剩原来那么大：缩回原样；连最小都放不下：None
+        let mut full = config.clone();
+        full.layout.pages[0].modules[0].set_rect(Rect::new(0.0, 0.0, 1.0, 0.5));
+        full.layout.pages[0].modules.push(Module { id: "c".into(), kind: ModuleKind::Touchpad, x: 0.0, y: 0.5, w: 4.0, h: 7.5, ..Default::default() });
+        full.layout.pages[0].modules.push(Module { id: "d".into(), kind: ModuleKind::Touchpad, x: 1.0, y: 0.0, w: 3.0, h: 0.5, ..Default::default() });
+        let r = fit_screen(&full, 0, 0, Rect::new(0.0, 0.0, 1.0, 0.5), Rect::new(0.0, 0.0, 2.0, 0.5), geometry::RIGHT, true, ratio);
+        assert_eq!(r, Some(Rect::new(0.0, 0.0, 1.0, 0.5)));
+        full.layout.pages[0].modules[1].set_rect(Rect::new(0.0, 0.0, 4.0, 8.0));
+        assert_eq!(fit_screen(&full, 0, 0, Rect::new(0.0, 0.0, 1.0, 0.5), Rect::new(0.0, 0.0, 2.0, 0.5), geometry::RIGHT, true, ratio), None);
     }
 }

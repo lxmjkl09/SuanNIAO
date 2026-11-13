@@ -71,8 +71,15 @@ class LinkService : Service() {
         CONNECTED,
     }
 
-    /** lan、bt：现在哪条连接连着（两条可以同时连着） */
-    class Status(val phase: Phase, val pcName: String?, val lan: Boolean = false, val bt: Boolean = false) {
+    /**
+     * lan、bt：现在哪条连接连着（两条可以同时连着）。
+     * lanPhase：局域网那条在干什么（正在连、等着重试……）；pcOffline：电脑说它自己没有网，只在蓝牙连着、局域网没连上时才是 true。
+     * 后两个给「电脑屏幕」模块说清楚为什么没画面（v3.3 U4），通知上不用
+     */
+    class Status(
+        val phase: Phase, val pcName: String?, val lan: Boolean = false, val bt: Boolean = false,
+        val lanPhase: LanPhase = LanPhase.NONE, val pcOffline: Boolean = false,
+    ) {
         val connected get() = phase == Phase.CONNECTED
         /** 连着时走的是哪种：「局域网」「蓝牙」「局域网 + 蓝牙」 */
         val via: String? get() = when {
@@ -99,7 +106,14 @@ class LinkService : Service() {
         val service: LinkService get() = this@LinkService
     }
 
+    /** 界面：开着（在前台）时设上，退到后台（onStop）清掉 */
     var listener: Listener? = null
+        set(value) {
+            field = value
+            uiVisible = value != null
+        }
+    /** 界面在前台：局域网断了重连得勤一点（最多隔 5 秒，见 LanRetryPolicy）；后台照旧最多 10 秒，省电 */
+    @Volatile private var uiVisible = false
 
     @Volatile var connected = false
         private set
@@ -144,11 +158,11 @@ class LinkService : Service() {
          * 局域网连接的发送队列：Android 不让主线程碰网络（蓝牙不管），而心跳、配置回执这些是在主线程发的，
          * 所以局域网的消息都排进这里，由这条连接自己的写线程按顺序写出去
          */
-        val queue: LinkedBlockingQueue<Any>? = if (lan) LinkedBlockingQueue() else null
+        val queue: LanInputQueue? = if (lan) LanInputQueue() else null
 
         fun close() {
             closed = true
-            queue?.offer(STOP)
+            queue?.stop()
             runCatching { socket.close() }
         }
 
@@ -204,15 +218,28 @@ class LinkService : Service() {
     /** 局域网绑定的电脑名 */
     @Volatile private var lanPcName: String? = null
     private val lanKicks = LinkedBlockingQueue<Unit>()
-    @Volatile private var lanBackoff = 1000L
+    @Volatile private var lanBackoff = LanRetryPolicy.FIRST_MS
     @Volatile private var lanQuiet = false
+    /** 电脑说它正连着别的手机：隔久一点再试（LanRetryPolicy.BUSY_MS），连上一次没被拒就清掉 */
+    @Volatile private var lanBusy = false
+    /**
+     * 电脑说它现在没有网（lan 消息里 addrs 是空的，v3.3 U4）：「电脑屏幕」模块说「电脑的网络断了」。
+     * 电脑再发来地址、局域网连上了、换了电脑就清掉
+     */
+    @Volatile var pcOffline = false
+        private set
+    /** 电脑的地址每变一次加一：正在一个一个试旧地址的那一轮看到变了，就不再试剩下的旧地址，马上按新地址连 */
+    @Volatile private var lanAddrGen = 0
+    /** 上一次因为收到电脑地址马上重连：那份地址和时刻。同一份地址蓝牙、局域网各来一遍时只连一次 */
+    private var lanInfoKick: Pair<String, Long>? = null
     private var wifiLock: WifiManager.WifiLock? = null
     /** 连上 Wi-Fi 时马上试局域网，不用等重试 */
     private val wifiCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             lanLog("Wi-Fi 可用")
-            lanBackoff = 1000L
+            lanBackoff = LanRetryPolicy.FIRST_MS
             lanQuiet = false
+            lanBusy = false
             lanKicks.offer(Unit)
         }
     }
@@ -356,14 +383,20 @@ class LinkService : Service() {
      * 没连着就马上重连（不等退避）。澎湃 OS 息屏、切到别的 App 一会儿后会冻结蒜鸟，同时掐断它的网络连接
      */
     fun wake() {
+        checkLanSoon()
+        lanBackoff = LanRetryPolicy.FIRST_MS
+        lanQuiet = false
+        lanBusy = false
+        lanKicks.offer(Unit)
+    }
+
+    /** 局域网连着的话发一次心跳，2 秒内没回音就当断了（心跳在亮屏时每秒查一次） */
+    private fun checkLanSoon() {
         lanConn?.let { c ->
             val due = SystemClock.elapsedRealtime() - (LAN_DEAD_MS - LAN_WAKE_CHECK_MS)
             c.awaitSince = if (c.awaitSince == 0L) due else minOf(c.awaitSince, due)
             sendPing(c)
         }
-        lanBackoff = 1000L
-        lanQuiet = false
-        lanKicks.offer(Unit)
     }
 
     /** 蓝牙刚打开：马上去连，不用等重试 */
@@ -467,6 +500,10 @@ class LinkService : Service() {
             lanPcName = cur?.lan?.name
             quiet = false
             lanQuiet = false
+            // 「电脑没网」「电脑正连着别的手机」说的是原来那台
+            pcOffline = false
+            lanBusy = false
+            lanInfoKick = null
         }
         // 蓝牙：地址不是正在用那台的，或者 hello 说了是另一台电脑（��号对不上）
         val bt = btConn?.takeIf { c ->
@@ -495,7 +532,7 @@ class LinkService : Service() {
         }
         if (pcChanged || nameChanged || bt != null || lan != null) {
             // 名字变了也要刷新：状态里的名字是 targetName
-            status = Status(status.phase, null, status.lan, status.bt)
+            status = Status(status.phase, null, status.lan, status.bt, status.lanPhase, status.pcOffline)
             recompute()
             updateNotification()
         }
@@ -571,8 +608,9 @@ class LinkService : Service() {
         backoff = 1000L
         quiet = false
         kicks.offer(Unit)
-        lanBackoff = 1000L
+        lanBackoff = LanRetryPolicy.FIRST_MS
         lanQuiet = false
+        lanBusy = false
         lanKicks.offer(Unit)
     }
 
@@ -600,7 +638,7 @@ class LinkService : Service() {
     fun send(msg: JSONObject): Boolean {
         lastInputAt = System.currentTimeMillis()
         val c = route(msg) ?: return false
-        return write(c, msg.toString())
+        return write(c, msg.toString(), msg.optString("t") == "screenPointer" && msg.optString("a") == "move")
     }
 
     /** 两条连接都发（亮屏、息屏这种每个会话都要知道的） */
@@ -611,10 +649,10 @@ class LinkService : Service() {
     }
 
     /** 每条连接一把写锁：界面线程的消息和写线程的移动、滚动不会交错；蓝牙写得慢时不耽误局域网 */
-    private fun write(c: Conn, line: String): Boolean {
+    private fun write(c: Conn, line: String, screenMove: Boolean = false): Boolean {
         val queue = c.queue ?: return writeNow(c, line)
         if (c.closed) return false
-        queue.offer(line)
+        queue.offer(line, screenMove)
         return true
     }
 
@@ -623,8 +661,8 @@ class LinkService : Service() {
         val queue = c.queue ?: return
         while (!c.closed) {
             val item = queue.take()
-            if (item === Conn.STOP || c.closed) return
-            if (!writeNow(c, item as String)) return
+            if (item == null || c.closed) return
+            if (!writeNow(c, item)) return
         }
     }
 
@@ -748,7 +786,8 @@ class LinkService : Service() {
         quiet = false
         lanQuiet = false
         backoff = 1000L
-        lanBackoff = 1000L
+        lanBackoff = LanRetryPolicy.FIRST_MS
+        lanBusy = false
         kicks.clear()
         lanKicks.clear()
         thread(name = "link-connect", isDaemon = true) { connectLoop(gen) }
@@ -844,10 +883,13 @@ class LinkService : Service() {
     /**
      * 局域网：扫码绑定过电脑就一直试着连（只在连着 Wi-Fi / 有线网时试），先试上次连上的地址。
      * 电脑说不认识这部手机了（电脑上解除了绑定）就停下，等重新扫码。
+     * 断了隔多久再试见 LanRetryPolicy（界面在前台最多 5 秒）；电脑发来新地址时马上按新地址连（updateLanAddress）。
      */
     private fun lanLoop(gen: Int) {
         fun alive() = running && gen == loopGen
         while (alive()) {
+            // 先记下地址的版本再读绑定：读完以后电脑换了地址，下面试地址时看得出来
+            val addrGen = lanAddrGen
             val binding = LanBinding.load(this)
             if (binding == null || binding.revoked) {
                 setLan(if (binding?.revoked == true) LanPhase.REVOKED else LanPhase.NONE, binding?.name)
@@ -869,10 +911,18 @@ class LinkService : Service() {
             if (!lanQuiet) setLan(LanPhase.CONNECTING, binding.name)
             var c: Conn? = null
             var socket: javax.net.ssl.SSLSocket? = null
+            /** 试到一半电脑发来了新地址：剩下的旧地址不试了，马上按新地址重来（不算失败、不等） */
+            var addrsMoved = false
             try {
                 var lastError: Exception? = null
-                for (addr in binding.tryOrder()) {
+                for ((i, addr) in binding.tryOrder().withIndex()) {
                     if (!alive()) return
+                    // 每一轮至少真试一个地址再看：电脑的地址来回变时也不会空转
+                    if (i > 0 && lanAddrGen != addrGen) {
+                        addrsMoved = true
+                        lastError = java.io.IOException("电脑的地址变了，按新地址重连")
+                        break
+                    }
                     try {
                         val s = LanSecure.connect(addr, binding.port, binding.fp, LAN_CONNECT_TIMEOUT_MS, localNetwork())
                         try {
@@ -922,16 +972,17 @@ class LinkService : Service() {
                     throw java.io.IOException("binding changed")
                 }
                 lanPcName = binding.name
-                lanBackoff = 1000L
+                lanBackoff = LanRetryPolicy.FIRST_MS
                 lanQuiet = false
+                // 连得上：电脑当然有网
+                pcOffline = false
                 greet(c)
                 setLan(LanPhase.CONNECTED, binding.name)
                 holdWifi(true)
                 readLoop(c)
-                if (c.busy) {
-                    Log.w(TAG, "lan: 电脑正连着另一部手机")
-                    lanBackoff = BUSY_BACKOFF_MS
-                }
+                // 电脑说正连着另一部手机（连上马上被拒）：隔 30 秒再试；正常用了一阵才断就照常
+                lanBusy = c.busy
+                if (c.busy) Log.w(TAG, "lan: 电脑正连着另一部手机")
             } catch (e: Exception) {
                 Log.w(TAG, "lan: ${e.message ?: e.javaClass.simpleName}")
                 lanLog("断开：${e.message ?: e.javaClass.simpleName}")
@@ -944,10 +995,16 @@ class LinkService : Service() {
                 socket?.let { runCatching { it.close() } }
             }
             if (!alive()) break
+            if (uiVisible && (addrsMoved || lanAddrGen != addrGen)) {
+                // 界面开着、这一轮里电脑发来了新地址：马上按新地址再连，不等、不算失败（这一轮至少真试过一个地址，不会空转）。
+                // 叫醒这里的就是那条新地址（updateLanAddress），不用再醒一次。在后台照常等退避（新地址来时会叫醒，见那里的限速）
+                lanKicks.clear()
+                continue
+            }
             lanQuiet = true
             setLan(LanPhase.WAITING, binding.name)
-            nap(lanBackoff, lanKicks)
-            lanBackoff = minOf(lanBackoff * 2, maxOf(lanBackoff, 10_000L))
+            nap(LanRetryPolicy.wait(lanBackoff, uiVisible, lanBusy), lanKicks)
+            lanBackoff = LanRetryPolicy.next(lanBackoff)
         }
     }
 
@@ -1068,7 +1125,7 @@ class LinkService : Service() {
 
     /**
      * 局域网的事记在 Android/data/dev.suanniao/files/lan.log（带时间，满 256 KB 换一个文件）：
-     * 用户说「断了连不上」时能看到当时发生了什么
+     * 连接失败时提供可供排查的状态信息
      */
     private fun lanLog(msg: String) {
         val line = java.text.SimpleDateFormat("MM-dd HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date()) + "  " + msg + "\n"
@@ -1208,20 +1265,70 @@ class LinkService : Service() {
         listener?.onLinkMessage(msg)
     }
 
-    /** 电脑说它现在的局域网地址（地址变了、刚连上时发）：是绑定的那台、证书也一样，就记下新地址 */
+    /**
+     * 电脑说它现在的局域网地址（地址变了、网断了又好了、刚连上时发；先走蓝牙再走局域网，同一条可能来两遍）。
+     * 是绑定的那台、证书也一样，就记下新地址（v3.3 U4）：
+     * - addrs 是空的 = 电脑现在没有网：记下的地址留着（网回来多半还是这几个），「电脑屏幕」模块说「电脑的网络断了」；
+     * - 有地址：「没网」清掉，局域网没连着就马上按这些地址重连，不等退避；连着、可是地址变了，2 秒内没回音就当断了，好按新地址重连。
+     */
     private fun updateLanAddress(msg: JSONObject) {
         val list = msg.optJSONArray("addrs") ?: return
         val addrs = (0 until list.length()).map { list.optString(it) }.filter { it.isNotBlank() }
-        val port = msg.optInt("port", 0)
-        if (addrs.isEmpty() || port !in 1..65535) return
-        var changed = false
-        Computers.updateLan(this, msg.optString("pc")) { cur ->
-            if (cur == null || msg.optString("pc") != cur.pc || msg.optString("fp") != cur.fp) return@updateLan cur
-            if (addrs == cur.addrs && port == cur.port) return@updateLan cur
-            changed = true
-            cur.copy(addrs = addrs, port = port)
+        val pc = msg.optString("pc")
+        // 「没网」、马上重连只管正在用的那台（地址照旧哪台的都记）
+        val bound = LanBinding.load(this)?.takeIf { it.pc == pc && it.fp == msg.optString("fp") && !it.revoked }
+        if (addrs.isEmpty()) {
+            if (bound == null) return
+            if (!pcOffline) {
+                pcOffline = true
+                lanInfoKick = null
+                lanLog("电脑说它没有网了")
+                recompute()
+            }
+            // 局域网还连着的话多半已经断了：2 秒内没回音就当断了
+            checkLanSoon()
+            return
         }
-        if (changed && lanConn == null) lanKicks.offer(Unit)
+        val port = msg.optInt("port", 0)
+        val screenPort = msg.optInt("screenPort", 0).takeIf { it in 1..65535 } ?: 0
+        val h264Port = msg.optInt("screenH264Port", 0).takeIf { it in 1..65535 } ?: 0
+        if (port !in 1..65535) return
+        var changed = false
+        Computers.updateLan(this, pc) { cur ->
+            if (cur == null || pc != cur.pc || msg.optString("fp") != cur.fp) return@updateLan cur
+            if (addrs == cur.addrs && port == cur.port && screenPort == cur.screenPort && h264Port == cur.screenH264Port) return@updateLan cur
+            changed = true
+            // 上次连上的地址电脑已经没有了：不再先试它（白等 2.5 秒）
+            cur.copy(addrs = addrs, port = port, screenPort = screenPort, screenH264Port = h264Port,
+                lastAddr = cur.lastAddr?.takeIf { it in addrs })
+        }
+        if (bound == null) return
+        if (changed) {
+            lanAddrGen++
+            lanLog("电脑的地址：${addrs.joinToString("、")}")
+        }
+        if (pcOffline) {
+            pcOffline = false
+            lanLog("电脑的网好了")
+            recompute()
+        }
+        if (lanConn != null) {
+            if (changed) checkLanSoon()
+            return
+        }
+        // 同一份地址蓝牙、局域网各来一遍、或者几秒内又来一遍：只马上连一次（之后照常按退避重试）。
+        // 在后台时最多 10 秒马上连一次：电脑的地址一直来回变的话别跟着一直连，费电
+        val sig = "${bound.pc}|${addrs.joinToString(",")}|$port"
+        val now = SystemClock.elapsedRealtime()
+        val last = lanInfoKick
+        if (last != null && ((last.first == sig && now - last.second < LAN_INFO_DEDUP_MS) ||
+                (!uiVisible && now - last.second < LanRetryPolicy.MAX_MS))) return
+        lanInfoKick = sig to now
+        lanLog("收到电脑的地址，马上重连局域网")
+        lanBackoff = LanRetryPolicy.FIRST_MS
+        lanQuiet = false
+        lanBusy = false
+        lanKicks.offer(Unit)
     }
 
     private fun writeLoop() {
@@ -1284,10 +1391,15 @@ class LinkService : Service() {
 
     private fun setPhase(phase: Phase, pc: String?, lan: Boolean = false, bt: Boolean = false) {
         val old = status
-        if (old.phase == phase && old.pcName == pc && old.lan == lan && old.bt == bt) return
-        val s = Status(phase, pc, lan, bt)
+        val lp = lanPhase
+        // 「电脑没网」只在蓝牙连着、局域网没连上时有用：蓝牙也断了就不知道电脑现在怎样
+        val offline = pcOffline && bt && !lan
+        val same = old.phase == phase && old.pcName == pc && old.lan == lan && old.bt == bt
+        if (same && old.lanPhase == lp && old.pcOffline == offline) return
+        val s = Status(phase, pc, lan, bt, lp, offline)
         status = s
-        updateNotification()
+        // 通知上只写连没连上、走哪条：局域网正在重连、电脑没网这些变了不用重发通知
+        if (!same) updateNotification()
         main.post { listener?.onLinkStatus(s) }
     }
 
@@ -1382,8 +1494,10 @@ class LinkService : Service() {
         private const val LAN_WAKE_CHECK_MS = 2000L
         /** 两次心跳（每秒一次）隔了这么久：进程被冻结过 */
         private const val THAW_GAP_MS = 3000L
-        /** 电脑说正连着另一部手机：隔久一点再试，别和那部来回抢 */
+        /** 电脑说正连着另一部手机：隔久一点再试，别和那部来回抢（局域网那边见 LanRetryPolicy.BUSY_MS） */
         private const val BUSY_BACKOFF_MS = 30_000L
+        /** 同一份电脑地址（蓝牙、局域网各来一遍）这么久里只马上重连一次 */
+        private const val LAN_INFO_DEDUP_MS = 5000L
         /** 和电脑端 link.rs 里的 SERVICE_UUID 一致。 */
         val SERVICE_UUID: UUID = UUID.fromString("5f6a1c2e-8b3d-4e7f-9a10-2b3c4d5e6f70")
 
@@ -1393,4 +1507,27 @@ class LinkService : Service() {
             .setClass(context, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
     }
+}
+
+/**
+ * 局域网断了以后隔多久再试（v3.3 U4）：从 1 秒起每次翻倍，最多 10 秒。
+ * 界面开着（在前台）最多 5 秒：用户日志里电脑恢复后手机有时 40 秒才连回来；在后台照旧最多 10 秒，省电。
+ * 电脑说正连着别的手机就隔 30 秒，别和那部来回抢（在前台也一样）。
+ * 收到电脑发来的地址、回到前台、Wi-Fi 刚连上、点「重试」都会马上再试，不等这里。
+ */
+internal object LanRetryPolicy {
+    const val FIRST_MS = 1000L
+    const val MAX_MS = 10_000L
+    const val FOREGROUND_MAX_MS = 5000L
+    const val BUSY_MS = 30_000L
+
+    /** 这次等多久：backoff 是现在退避到多少，foreground = 界面开着，busy = 电脑正连着别的手机 */
+    fun wait(backoff: Long, foreground: Boolean, busy: Boolean): Long = when {
+        busy -> BUSY_MS
+        foreground -> minOf(backoff, FOREGROUND_MAX_MS)
+        else -> minOf(backoff, MAX_MS)
+    }
+
+    /** 又没连上：下一次的退避翻倍，最多 10 秒 */
+    fun next(backoff: Long): Long = minOf(backoff * 2, MAX_MS).coerceAtLeast(FIRST_MS)
 }

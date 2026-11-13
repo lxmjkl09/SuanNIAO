@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 只合进调试版：测检查更新时，允许连电脑上临时起的 http 服务（见 res/xml/debug_network.xml） -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:networkSecurityConfig="@xml/debug_network" />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application android:networkSecurityConfig="@xml/debug_network"
+        android:label="蒜鸟·开发版" tools:replace="android:label" />
 </manifest>

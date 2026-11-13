@@ -172,6 +172,7 @@ pub fn key_code(name: &str) -> Option<u16> {
         "ESC" | "ESCAPE" => 0x1B,
         "ENTER" | "RETURN" => 0x0D,
         "SPACE" => 0x20,
+        "CAPSLOCK" | "CAPS" => 0x14,
         "TAB" => 0x09,
         "BACKSPACE" => 0x08,
         "DELETE" | "DEL" => 0x2E,

@@ -127,7 +127,7 @@ fn switch_profile(direction: &str, wrap: bool) {
     match state::switch_profile(direction, wrap) {
         Ok(Some((from, to))) => {
             let dropped = cancel();
-            input::release_keys_all();
+            link::release_all_keys();
             link::push_config();
             link::send_to_phone(&serde_json::json!({"t": "profile", "from": from, "to": to}));
             overlay::show(&from, &to);

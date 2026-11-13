@@ -1,6 +1,7 @@
 //! 安装、更新、卸载蒜鸟（`SuanNIAO.exe --setup` / `--uninstall`）。
 //!
-//! 安装包（pc/setup）把 SuanNIAO.exe、SuanNIAO-core.exe 解到临时文件夹，运行里面的 `SuanNIAO.exe --setup`：
+//! 安装包（pc/setup）把 SuanNIAO.exe、SuanNIAO-core.exe（打包时给了的话还有 ffmpeg.exe）解到临时文件夹，
+//! 运行里面的 `SuanNIAO.exe --setup`：
 //! 安装界面是主界面程序的另一个窗口（app.slint 的 SetupWindow），和蒜鸟一个样子。
 //! - `--setup [--update] [--dir 文件夹] [--silent] [--no-desktop]`：装到 dir（默认是登记过的位置，没装过就是
 //!   %LOCALAPPDATA%\Programs\SuanNIAO），只给当前用户装、不要管理员权限。先关掉那个文件夹里开着的蒜鸟，换掉两个 exe，
@@ -47,6 +48,9 @@ use crate::{win, SetupWindow};
 const APP_ID: &str = "{DE1A7C69-32AD-4AD1-BF71-2B9B63532E2F}";
 /// 装的文件
 const FILES: [&str; 2] = ["SuanNIAO.exe", "SuanNIAO-core.exe"];
+/// 安装包里有才装的文件：远程画面编码用的 ffmpeg.exe（打包时设了 SUANNIAO_PACK_FFMPEG 才有），
+/// 放在 SuanNIAO-core.exe 旁边，后台先找这里。卸载、搬家时和 FILES 一样删掉
+const OPTIONAL_FILES: [&str; 1] = ["ffmpeg.exe"];
 /// 开始菜单、桌面上的快捷方式
 const LINK_NAME: &str = "蒜鸟.lnk";
 /// 开机自启（Run 里的名字，同 win.rs）
@@ -495,6 +499,17 @@ impl Job {
                 copy_in(&self.from.join(name), &dir.join(name))?;
             }
         }
+        // 安装包没带就不动：文件夹里原来有的（上一版带的、自己放的）留着照样用。
+        // 搬家时安装包又没带：把原来文件夹里的那份带过来（审查 #13：以前搬完新文件夹里没有，旧的又被删了，
+        // 远程画面只能退回 JPEG）
+        for name in OPTIONAL_FILES {
+            let src = self.from.join(name);
+            if !same && src.exists() {
+                copy_in(&src, &dir.join(name))?;
+            } else if let Some(previous) = carried_optional(self.old_dir.as_deref(), dir, name) {
+                copy_in(&previous, &dir.join(name))?;
+            }
+        }
         if self.mode == Mode::Install {
             report(0.75, "正在开始菜单里放「蒜鸟」…");
             self.shortcuts()?;
@@ -553,7 +568,7 @@ impl Job {
         for (name, value) in strings {
             set_string(key, name, &value)?;
         }
-        let size: u64 = FILES.iter().filter_map(|file| std::fs::metadata(self.dir.join(file)).ok()).map(|m| m.len()).sum();
+        let size: u64 = FILES.iter().chain(&OPTIONAL_FILES).filter_map(|file| std::fs::metadata(self.dir.join(file)).ok()).map(|m| m.len()).sum();
         let [major, minor, ..] = update::version_tuple(VERSION);
         for (name, value) in [("NoModify", 1), ("NoRepair", 1), ("EstimatedSize", (size / 1024) as u32), ("VersionMajor", major), ("VersionMinor", minor)] {
             set_dword(key, name, value)?;
@@ -564,10 +579,14 @@ impl Job {
         Ok(())
     }
 
-    /// 搬家以后删掉原来那份：只删蒜鸟自己的文件，文件夹空了才删；桌面快捷方式、开机自启改指新位置
+    /// 搬家以后删掉原来那份：只删蒜鸟自己的文件，文件夹空了才删；桌面快捷方式、开机自启改指新位置。
+    /// ffmpeg.exe 这种可有可无的文件，新文件夹里有了才删旧的（带不过来时宁可留在原处，也不能弄丢）
     fn remove_old(&self, old: &Path) {
-        for name in FILES.iter().copied().chain(["unins000.exe", "unins000.dat", "unins000.msg"]) {
+        for name in FILES.into_iter().chain(OPTIONAL_FILES).chain(["unins000.exe", "unins000.dat", "unins000.msg"]) {
             let path = old.join(name);
+            if OPTIONAL_FILES.contains(&name) && !self.dir.join(name).exists() {
+                continue;
+            }
             if path.exists() {
                 remove_file_retry(&path);
             }
@@ -598,7 +617,8 @@ impl Job {
         // 自己（正在跑的 SuanNIAO.exe）删不了，退出以后再删（delete_self_later）
         let me = std::env::current_exe().ok();
         let mut stuck = Vec::new();
-        for name in FILES {
+        // ffmpeg.exe 可能还被刚关掉的后台起的 ffmpeg 占着一小会儿：remove_file_retry 会多等几次
+        for name in FILES.into_iter().chain(OPTIONAL_FILES) {
             let path = dir.join(name);
             if !path.exists() || me.as_deref().is_some_and(|me| same_file(me, &path)) {
                 continue;
@@ -666,12 +686,19 @@ fn copy_in(src: &Path, dest: &Path) -> Result<(), String> {
     Err(format!("{name} 正被占着，换不了。关掉蒜鸟以后点「重试」。"))
 }
 
+/// 搬家（old 是原来的文件夹）时要从原来那里带过来的可有可无的文件：原来有、新文件夹里还没有才带。
+/// 不是搬家、原来就没有、新文件夹已经有了（同一个文件夹、自己放过）返回 None
+fn carried_optional(old: Option<&Path>, dir: &Path, name: &str) -> Option<PathBuf> {
+    let previous = old?.join(name);
+    (previous.is_file() && !dir.join(name).exists() && !same_place(old?, dir)).then_some(previous)
+}
+
 /// 上次没装完留下的「.new」、让开的「.old-时间」
 fn remove_leftovers(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if FILES.iter().any(|file| name == format!("{file}.new") || name.starts_with(&format!("{file}.old-"))) {
+        if FILES.iter().chain(&OPTIONAL_FILES).any(|file| name == format!("{file}.new") || name.starts_with(&format!("{file}.old-"))) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -845,5 +872,28 @@ mod tests {
     fn places() {
         assert!(same_place(Path::new("C:\\A\\b\\"), Path::new("c:\\a\\B")));
         assert!(!same_place(Path::new("C:\\A\\b"), Path::new("C:\\A\\bc")));
+    }
+
+    /// 搬家时安装包没带 ffmpeg：原来文件夹里有、新文件夹里没有才带过来（审查 #13）
+    #[test]
+    fn move_carries_ffmpeg_when_the_installer_has_none() {
+        let root = std::env::temp_dir().join(format!("suanniao-setup-carry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (old, new) = (root.join("old"), root.join("new"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        // 原来没有：不带
+        assert_eq!(carried_optional(Some(&old), &new, "ffmpeg.exe"), None);
+        std::fs::write(old.join("ffmpeg.exe"), b"ffmpeg").unwrap();
+        // 不是搬家、同一个文件夹：不带
+        assert_eq!(carried_optional(None, &new, "ffmpeg.exe"), None);
+        assert_eq!(carried_optional(Some(&old), &old, "ffmpeg.exe"), None);
+        // 搬家：带过来
+        assert_eq!(carried_optional(Some(&old), &new, "ffmpeg.exe"), Some(old.join("ffmpeg.exe")));
+        copy_in(&old.join("ffmpeg.exe"), &new.join("ffmpeg.exe")).unwrap();
+        assert_eq!(std::fs::read(new.join("ffmpeg.exe")).unwrap(), b"ffmpeg");
+        // 新文件夹已经有了：不再带（也不会盖掉）
+        assert_eq!(carried_optional(Some(&old), &new, "ffmpeg.exe"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

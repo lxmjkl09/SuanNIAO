@@ -79,6 +79,15 @@ class VoiceButton(
     var localModel: LocalAsr.Model? = null
     /** 本地识别时边说边往电脑上打字；false = 停顿一下（一句说完）再整句发 */
     var liveTyping = true
+    /** Remote fullscreen: stage the final transcript for editing before sending.
+     * Null preserves all existing official-layout voice behavior. */
+    var onRemoteDraft: ((String) -> Unit)? = null
+    /** Optional observer for the remote-workbench task state, without changing original voice behavior. */
+    var onActiveChanged: ((Boolean) -> Unit)? = null
+    /** Emitted when tap-to-talk switches recording/recognizing/idle; independent of busy. */
+    var onRecordingPhaseChanged: ((Boolean, Boolean) -> Unit)? = null
+    private var previousRecording = false
+    private var previousAwaiting = false
     /** 没连上电脑（待机时提示说的话会先存在手机上） */
     var offline = false
         set(value) {
@@ -233,6 +242,12 @@ class VoiceButton(
     /** 正在录音或者还在收尾（这时别弹面板、别调暗屏幕） */
     fun isBusy() = active
 
+    /** A finishing recognition is still busy, but must not look like recording. */
+    fun isRecordingNow(): Boolean = VoiceTapPolicy.phase(holding, latched, active) == VoiceTapPolicy.Phase.RECORDING
+
+    /** The second tap ended capture; a final ASR result is still pending. */
+    fun isAwaitingResult(): Boolean = VoiceTapPolicy.phase(holding, latched, active) == VoiceTapPolicy.Phase.RECOGNIZING
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
         when (e.actionMasked) {
@@ -374,7 +389,7 @@ class VoiceButton(
         r.startListening(intent)
     }
 
-    /** 用户说完了：让识别收尾，最终结果会在 onResults（本地识别是 LocalPress.onDone）里到。 */
+    /** 录音结束后让识别收尾，最终结果会在 onResults（本地识别是 LocalPress.onDone）里到。 */
     private fun finish() {
         val local = press
         if (local != null) {
@@ -405,6 +420,10 @@ class VoiceButton(
         lastSentAt = now
         lastHeardAt = now
         sentThisPress = true
+        onRemoteDraft?.let { receiver ->
+            post { receiver(text) }
+            return
+        }
         if (pressOffline || !onSend(text)) {
             pressOffline = true
             onStash(text)
@@ -440,6 +459,40 @@ class VoiceButton(
         refresh()
     }
 
+    /**
+     * One-tap hands-free recording for the remote workbench.
+     * The original press/slide-to-lock interaction is deliberately preserved.
+     */
+    fun toggleTapToTalk() {
+        when (VoiceTapPolicy.tapAction(VoiceTapPolicy.phase(holding, latched, active))) {
+            VoiceTapPolicy.TapAction.STOP -> {
+                stopListening()
+                return
+            }
+            VoiceTapPolicy.TapAction.WAIT -> {
+                onNotice("正在识别上一段语音，请稍后")
+                return
+            }
+            VoiceTapPolicy.TapAction.START -> Unit
+        }
+        if (!hasMicPermission()) {
+            onNotice("请先开启麦克风权限")
+            return
+        }
+        if (localModel == null && !SpeechRecognizer.isRecognitionAvailable(context)) {
+            onNotice("手机没有可用的语音识别服务")
+            return
+        }
+        pressOffline = !isConnected()
+        quickFailures = 0
+        sentThisPress = false
+        gaveUp = false
+        idleStopped = false
+        lastHeardAt = SystemClock.uptimeMillis()
+        start()
+        latch()
+    }
+
     /** App 退到后台（后台录不了音）、换页、点了顶栏的「点此结束」：正在听就当作说完了。 */
     fun stopListening() {
         if (!holding && !latched) return
@@ -468,6 +521,14 @@ class VoiceButton(
         if (nowActive && !active) activeSince = SystemClock.uptimeMillis()
         val wasActive = active
         active = nowActive
+        if (wasActive != nowActive) onActiveChanged?.invoke(nowActive)
+        val recordingNow = isRecordingNow()
+        val awaitingNow = isAwaitingResult()
+        if (previousRecording != recordingNow || previousAwaiting != awaitingNow) {
+            previousRecording = recordingNow
+            previousAwaiting = awaitingNow
+            onRecordingPhaseChanged?.invoke(recordingNow, awaitingNow)
+        }
         val savingLocally = pressOffline || local?.isOffline == true
         hint = when {
             local != null && !local.ready && (holding || latched) -> "正在加载语音模型…可以先说"
@@ -720,6 +781,7 @@ class VoiceButton(
         var done = false
             private set
         private var cancelled = false
+        private var draftDelivered = false
         /** 「说完一句再发」：停顿 pauseMs 没出新字，就把这一句发出去 */
         private val commit = Runnable { flush(last = false) }
         /** 模型隔一阵才出一次字（960ms 的模型约 1 秒一次），停顿要比这个间隔长出一截，不然话没说完就被一段段发出去 */
@@ -793,6 +855,20 @@ class VoiceButton(
 
         /** 把还没发到电脑上的字发出去。上一次按住的字还没发完就先攒着，它发完会叫 resume()。 */
         private fun flush(last: Boolean) {
+            if (cancelled || previous?.done == false) return
+            // Defer all remote fullscreen output until transcription is final;
+            // keep the official voice input path unchanged when no sink is set.
+            val draftSink = onRemoteDraft
+            if (draftSink != null) {
+                previous = null
+                if (last && !draftDelivered) {
+                    draftDelivered = true
+                    val finalText = text.trim()
+                    if (finalText.isNotEmpty()) post { draftSink(finalText) }
+                }
+                if (last) next?.resume()
+                return
+            }
             if (cancelled || previous?.done == false) return
             previous = null
             if (!offline) {

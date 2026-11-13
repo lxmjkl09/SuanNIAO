@@ -21,6 +21,8 @@ data class LanBinding(
     val phoneId: String,
     val sealedToken: String,
     val lastAddr: String? = null,
+    val screenPort: Int = 0,
+    val screenH264Port: Int = 0,
     val revoked: Boolean = false,
 ) {
     /** 先试上次连上的地址 */
@@ -29,6 +31,7 @@ data class LanBinding(
     fun toJson(): JSONObject = JSONObject()
         .put("pc", pc).put("name", name).put("addrs", JSONArray(addrs)).put("port", port).put("fp", fp)
         .put("phoneId", phoneId).put("token", sealedToken).put("lastAddr", lastAddr).put("revoked", revoked)
+        .put("screenPort", screenPort).put("screenH264Port", screenH264Port)
 
     companion object {
         /** 旧版单独存绑定的偏好（现在存在 Computers 里，只迁移时读） */
@@ -45,6 +48,8 @@ data class LanBinding(
                 phoneId = o.getString("phoneId"),
                 sealedToken = o.getString("token"),
                 lastAddr = if (o.isNull("lastAddr")) null else o.optString("lastAddr").ifBlank { null },
+                screenPort = o.optInt("screenPort", 0).takeIf { it in 1..65535 } ?: 0,
+                screenH264Port = o.optInt("screenH264Port", 0).takeIf { it in 1..65535 } ?: 0,
                 revoked = o.optBoolean("revoked", false),
             )
         }.getOrNull()

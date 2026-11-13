@@ -135,8 +135,27 @@ impl Server {
     /// write deadline.
     pub fn accept(
         &self,
+        tcp: TcpStream,
+        pairings: &Pairings,
+    ) -> Result<(SecureConn, AuthedPhone), AcceptError> {
+        self.accept_inner(tcp, pairings, true)
+    }
+
+    /// Video/auxiliary port: accept only pre-paired phones, never consume QR codes
+    /// or create new pairing credentials through an auxiliary listener.
+    pub fn accept_existing(
+        &self,
+        tcp: TcpStream,
+        pairings: &Pairings,
+    ) -> Result<(SecureConn, AuthedPhone), AcceptError> {
+        self.accept_inner(tcp, pairings, false)
+    }
+
+    fn accept_inner(
+        &self,
         mut tcp: TcpStream,
         pairings: &Pairings,
+        allow_pair: bool,
     ) -> Result<(SecureConn, AuthedPhone), AcceptError> {
         let deadline = Instant::now() + ACCEPT_TIMEOUT;
         let mut tls = ServerConnection::new(self.config.clone()).map_err(io::Error::other)?;
@@ -155,6 +174,9 @@ impl Server {
             let request: AuthRequest =
                 serde_json::from_slice(&line).map_err(|_| AcceptError::rejected("protocol"))?;
             check_deadline(deadline)?;
+            if !allow_pair && matches!(request, AuthRequest::Pair { .. }) {
+                return Err(AcceptError::rejected("protocol"));
+            }
             let (record, newly_paired, response) = storage_before_deadline(&tcp, deadline, || {
                 Ok(match request {
                     AuthRequest::Pair {

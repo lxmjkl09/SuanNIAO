@@ -4,7 +4,8 @@
 //! 变了就重新读取并同步给手机。手机上调好的布局由这里校验后写回这个文件。
 //! 运行状态写到 status.json，给主界面首页显示。
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Dev builds also run independently of a console; diagnostics remain in log files.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod actions;
 mod btpair;
@@ -18,11 +19,14 @@ mod launcher;
 mod link;
 mod overlay;
 mod playout;
+mod screen;
+mod screen_h264;
 mod state;
 mod trace;
 mod tray;
 mod update;
 mod util;
+mod workbench_v2;
 
 use std::time::{Duration, SystemTime};
 
@@ -52,6 +56,11 @@ fn main() {
     }
     state::restore_usage();
     state::load_config_at_start();
+    match state::ensure_workbench_v3() {
+        Ok(true) => log!("🧩 远程工作台布局已补成新格式（旧数据留着）"),
+        Ok(false) => {}
+        Err(e) => log!("⚠ 远程工作台布局没补上：{e}"),
+    }
     log!("蒜鸟后台 {} 启动（{}），{}", env!("CARGO_PKG_VERSION"), util::host_name(), util::memory());
 
     // 蓝牙串口服务：电脑蓝牙关着时开不起来，每 10 秒再试一次（打开蓝牙以后不用重启后台）
@@ -123,9 +132,9 @@ fn watch_config() {
             if !state::reload_config() {
                 continue;
             }
-            // 改了配置：还没执行的动作不做了，直通按着的键都松开（和 axonkey 一样）
+            // 改了配置：还没执行的动作不做了，直通按着的键都松开（和 axonkey 一样），并告诉手机（K4）
             let dropped = actions::cancel();
-            input::release_keys_all();
+            link::release_all_keys();
             link::push_config();
             log!("🔄 配置已更新并同步到手机{}", if dropped > 0 { format!("（取消了 {dropped} 步还没执行的动作）") } else { String::new() });
         }

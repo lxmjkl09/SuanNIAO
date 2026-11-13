@@ -194,6 +194,28 @@ impl Config {
         }
     }
 
+    /// 刚建好的按键（手机上新建的快捷发送、热键，工作台的默认热键）：每个还没有它的方案里都放一份现在的映射。
+    /// 工作台所有方案共用，只放进当前方案的话，切了方案那个按钮点了没反应，手机上也改不了、删不了
+    pub(crate) fn share_new_button(&mut self, id: &str) {
+        let Some(mapping) = self.find_module(id).filter(|m| m.kind == ModuleKind::Button).map(ButtonMapping::of) else { return };
+        for profile in &mut self.profiles {
+            profile.buttons.entry(id.to_string()).or_insert_with(|| mapping.clone());
+        }
+    }
+
+    /// 手机上改了按键的映射（before 是改之前的样子，当前方案已经存好新的）：别的方案里和 before 一模一样的
+    /// （新建时抄过去、没在电脑上单独改过的）跟着改。按键的名字所有方案共用，不跟着改就成了新名字配旧文字；
+    /// 在电脑上给某个方案单独改过的不动
+    pub(crate) fn follow_edit(&mut self, id: &str, before: &ButtonMapping) {
+        let Some(after) = self.find_module(id).filter(|m| m.kind == ModuleKind::Button).map(ButtonMapping::of) else { return };
+        let active = self.active_profile_id.clone();
+        for profile in self.profiles.iter_mut().filter(|p| p.id != active) {
+            if let Some(mapping) = profile.buttons.get_mut(id).filter(|m| **m == *before) {
+                *mapping = after.clone();
+            }
+        }
+    }
+
     /// 把当前方案的映射抄到模块上（方案里没有的按键清空）
     fn load_active_profile(&mut self) {
         let Some(profile) = self.active_profile().cloned() else { return };
@@ -360,6 +382,8 @@ impl Config {
         for module in page.modules.iter_mut().filter(|m| m.kind == ModuleKind::Button) {
             ButtonMapping::default().apply(module);
         }
+        // 这一页的 id 是 next_id 先定下的（见 axonkey::Import::build_page）：编号记下，以后不再发
+        self.note_id(&page.id);
         self.layout.pages.push(page);
         if let Some(profile) = self.profiles.iter_mut().find(|p| p.id == id) {
             profile.buttons.extend(mappings);

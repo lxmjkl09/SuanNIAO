@@ -19,6 +19,9 @@ const EVERY_SECS: u64 = 6 * 3600;
 const RETRY_SECS: u64 = 30 * 60;
 
 pub fn run() {
+    if let Some(repo) = update::custom_repo() {
+        log!("🧪 开发版：检查更新只看 GitHub 上的 {repo}");
+    }
     std::thread::sleep(Duration::from_secs(60));
     let (mut found, mut failed) = (String::new(), String::new());
     loop {
@@ -26,9 +29,10 @@ pub fn run() {
         let wait = if state.error.is_empty() { EVERY_SECS } else { RETRY_SECS };
         if state.auto && config::now_secs().saturating_sub(state.checked) >= wait {
             match update::check() {
+                // None：开发版指定的仓库还没发过版本，当成已是最新
                 Ok(manifest) => {
                     failed.clear();
-                    if update::newer(&manifest.pc.version, VERSION) && manifest.pc.version != found {
+                    if let Some(manifest) = manifest.filter(|m| update::newer(&m.pc.version, VERSION) && m.pc.version != found) {
                         log!("🆕 有新版本：电脑端 {}（{}）", manifest.pc.version, manifest.tag);
                         found = manifest.pc.version;
                     }

@@ -25,6 +25,22 @@ pub struct Entry {
     pub data: Vec<u8>,
 }
 
+/// 安装包里可以多带的 ffmpeg：远程画面用它编码，后台先找 SuanNIAO-core.exe 旁边的这个名字
+pub const FFMPEG: &str = "ffmpeg.exe";
+
+/// 打包时多带一个 ffmpeg：不管原来叫什么，包里都叫 ffmpeg.exe（后台只认这个名字）
+pub fn add_ffmpeg(entries: &mut Vec<Entry>, data: Vec<u8>) -> Result<(), String> {
+    // exe 都以「MZ」开头：防止把压缩包之类的当成 ffmpeg 打进去，装上以后才发现用不了
+    if !data.starts_with(b"MZ") {
+        return Err("不是 exe 文件".into());
+    }
+    if entries.iter().any(|entry| entry.name.eq_ignore_ascii_case(FFMPEG)) {
+        return Err(format!("要装的文件里已经有 {FFMPEG} 了"));
+    }
+    entries.push(Entry { name: FFMPEG.into(), data });
+    Ok(())
+}
+
 /// 打安装包：启动程序 + 压缩好的文件 + 尾巴
 pub fn build(stub: &[u8], entries: &[Entry]) -> Result<Vec<u8>, String> {
     let mut raw = Vec::new();
@@ -167,5 +183,24 @@ mod tests {
         assert!(open(&bad).is_err());
         assert!(open(b"short").is_err());
         assert!(build(b"", &[Entry { name: "../x".into(), data: vec![] }]).is_err());
+    }
+
+    #[test]
+    fn ffmpeg_is_packed_under_its_fixed_name() {
+        let mut entries = vec![Entry { name: "SuanNIAO-core.exe".into(), data: b"MZcore".to_vec() }];
+        // 不是 exe 的不收
+        assert!(add_ffmpeg(&mut entries, b"PK\x03\x04zip".to_vec()).is_err());
+        assert_eq!(entries.len(), 1);
+        add_ffmpeg(&mut entries, b"MZffmpeg".to_vec()).unwrap();
+        // 给两次不行（大小写不同也算同一个）
+        assert!(add_ffmpeg(&mut entries, b"MZagain".to_vec()).is_err());
+        entries[1].name = "FFmpeg.EXE".into();
+        assert!(add_ffmpeg(&mut entries, b"MZagain".to_vec()).is_err());
+        entries[1].name = FFMPEG.into();
+        // 打进安装包再解开，名字、内容都对
+        let back = open(&build(b"MZstub", &entries).unwrap()).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[1].name, "ffmpeg.exe");
+        assert_eq!(back[1].data, b"MZffmpeg");
     }
 }

@@ -27,12 +27,18 @@ pub fn presets() -> Vec<Preset> {
         p("常用", "返回 / 取消（Esc）", key("Esc")),
         p("常用", "空格", key("Space")),
         p("常用", "切换焦点（Tab）", key("Tab")),
+        // Alt+Tab 会被 Windows 抢先切走录制窗口，因此必须提供无需录制的现成动作。
+        p("常用", "切换应用（Alt+Tab）", vec![keys(&["Alt", "Tab"])]),
+        p("常用", "反向切换应用（Alt+Shift+Tab）", vec![keys(&["Alt", "Shift", "Tab"])]),
+        p("常用", "任务视图（Win+Tab）", vec![keys(&["Win", "Tab"])]),
         p(
             "常用",
             "输入文本并回车（文字填在第一步）",
             vec![Action::Paste { text: String::new(), mode: None }, Action::Delay { ms: 30 }, Action::Key { key: "Enter".into() }],
         ),
         p("常用", "回到桌面（Win+D）", vec![keys(&["Win", "D"])]),
+        p("常用", "微信截图（Alt+A，需在微信启用）", vec![keys(&["Alt", "A"])]),
+        p("常用", "Alt+E（作用由当前应用决定）", vec![keys(&["Alt", "E"])]),
         p("常用", "上一标签页（Ctrl+Shift+Tab）", vec![keys(&["Ctrl", "Shift", "Tab"])]),
         p("常用", "下一标签页（Ctrl+Tab）", vec![keys(&["Ctrl", "Tab"])]),
         p("写代码和终端", "换行不发送（Shift+Enter）", vec![keys(&["Shift", "Enter"])]),
@@ -44,6 +50,7 @@ pub fn presets() -> Vec<Preset> {
         p("写代码和终端", "上一条命令（↑）", key("Up")),
         p("写代码和终端", "删前一个词（Ctrl+Backspace）", vec![keys(&["Ctrl", "Backspace"])]),
         p("写代码和终端", "删除全部文本（Ctrl+A，Backspace）", vec![keys(&["Ctrl", "A"]), Action::Delay { ms: 30 }, Action::Key { key: "Backspace".into() }]),
+        p("写代码和终端", "全选（Ctrl+A）", vec![keys(&["Ctrl", "A"])]),
         p("写代码和终端", "复制（Ctrl+C）", vec![keys(&["Ctrl", "C"])]),
         p("写代码和终端", "粘贴（Ctrl+V）", vec![keys(&["Ctrl", "V"])]),
         p("写代码和终端", "保存（Ctrl+S）", vec![keys(&["Ctrl", "S"])]),
@@ -95,7 +102,16 @@ mod tests {
             }
         }
         let all = super::presets();
-        assert_eq!(all.len(), 53);
+        assert_eq!(all.len(), 59);
+        for (label, chord) in [
+            ("切换应用（Alt+Tab）", vec!["Alt", "Tab"]),
+            ("反向切换应用（Alt+Shift+Tab）", vec!["Alt", "Shift", "Tab"]),
+            ("任务视图（Win+Tab）", vec!["Win", "Tab"]),
+        ] {
+            let preset = all.iter().find(|p| p.name == label).expect("快捷键预设缺失");
+            assert_eq!(preset.actions.len(), 1);
+            assert_eq!(preset.actions[0].chord(), Some(chord.into_iter().map(str::to_string).collect()));
+        }
         // 清空放在最后
         assert_eq!(all.last().unwrap().group, "清空");
         // 删除全部文本不动剪贴板

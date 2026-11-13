@@ -184,17 +184,18 @@ impl Updater {
         });
     }
 
-    fn checked(self: &Rc<Self>, result: Result<Manifest, String>, manual: bool) {
+    fn checked(self: &Rc<Self>, result: Result<Option<Manifest>, String>, manual: bool) {
         self.checking.set(false);
         self.reload();
         match result {
-            Ok(manifest) if update::newer(&manifest.pc.version, VERSION) => {
+            Ok(Some(manifest)) if update::newer(&manifest.pc.version, VERSION) => {
                 if manual {
                     self.open();
                 } else {
                     self.maybe_show();
                 }
             }
+            // Ok(None)：开发版指定的仓库还没发过版本，也算已是最新
             Ok(_) if manual => toast("已经是最新版"),
             Err(e) if manual => toast(&format!("没查成：{e}")),
             _ => {}
@@ -274,11 +275,10 @@ impl Updater {
         }
     }
 
-    /// 去网页下载：这次发布的网页（只认 GitHub 上这个仓库的）
+    /// 去网页下载：这次发布的网页（只认 GitHub 上检查更新的那个仓库的）
     fn open_page(&self) {
         let page = self.shown.borrow().as_ref().map(|m| m.page.clone()).unwrap_or_default();
-        let page = if page.starts_with("https://github.com/drhhhao/SuanNIAO/") { page } else { update::RELEASES_PAGE.to_string() };
-        win::open_path(Path::new(&page));
+        win::open_path(Path::new(&update::release_page(&page)));
     }
 
     /// 立即更新：在别的线程里下载安装包，进度显示在更新窗口里

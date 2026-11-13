@@ -221,6 +221,51 @@
     - 它自己也要有麦克风权限，没有的话会报「权限不足」（错误 9）。
     - 遇到这种情况 App 会弹窗说明，点「去开启」直接跳到它的权限页。
 
+## 远程画面和全屏工作台（新增功能）
+
+手机上看着电脑屏幕操作电脑（「电脑屏幕」模块），全屏时画面上的悬浮球、侧栏、语音条、键鼠条。用法见 `docs/REMOTE_WORKBENCH_GUIDE.md`。
+
+- **布局数据**：配置顶层 `screenWorkbenchV3`（在 `Config.extra` 里，旧版电脑原样保留），只存引用：`fn:<id>`（手机动作：voice、keymouse、pointer、taskSwitch、captureWechat、captureQq、captureSystem）、`key:<名字>`（11 个基础键）、`button:<正式版按键 id>`。
+  - `slots.ball` 固定 8 格（`null` = 空），前三个 voice、keymouse、pointer 固定；`slots.voiceRow`、`slots.keymouse`、`slots.rail` 是可变长的一排。
+  - 一个引用只出现一次；基础键例外：语音条、键鼠条各能放一个。
+  - `geometry.portrait|landscape`：`voice` / `keymouse` 的 `{x, y, w, k}`（左上角占屏幕的比例、宽占屏幕宽的比例、缩放）和 `ball` 的 `{x, y}`。
+  - 校验两份保持一致：电脑 `pc/config/src/workbench.rs` 的 `normalize`，手机 `WorkbenchLayoutV3.problem` / `parse`。手机解析时跳过电脑上已经删掉的按键。
+- **迁移**（后台启动时 `state::ensure_workbench_v3`，可以重复跑）：没有 V3 或 V3 坏了就生成默认布局；写死的 Alt+F4（带 `confirm`）、Alt+E、复制、粘贴、撤销建成正式版按键，放在「远程快捷键」页（`remote-shortcuts`），全选用已有的 Ctrl+A 按键；V2 里用户加的正式版按键放回去。`screenWorkbenchV2` 留着不删。
+- **保存**：手机发 `screenWorkbenchV3Layout`（`workbench`、`requestId`）或 `screenWorkbenchV3Reset`，电脑校验、写配置（自动备份）、推 `config`，再回 `screenWorkbenchV3Saved`（`ok`、`error`）。手机等到回执加推回来的配置签名一样才退出编辑（`WorkbenchSaveGate`，10 秒超时）。
+- **按键属性**：`Module.extra.confirm = true` 时手机按之前先确认；发给手机的按键 JSON 带 `confirm`。
+- **修饰键**：`{"t":"mod","k":"ctrl|shift|alt|win","down":true|false}`，只收已认证的局域网连接、没暂停时；`input::modifier` 用 `hold_keys` / `release_keys` 按代数松开，断线时 `release_everything` 全部松开。手机端 `ModifierLatch`：关 → 一次 → 锁住 → 关，10 秒没用、退出全屏、`onPause` 时自动松开。
+- **运行时状态只在手机上**：SharedPreferences `screen_workbench_v3`（`WorkbenchSession`）：每个方向每条工具的 OPEN / COLLAPSED / HIDDEN、展开区、拖到的位置、小把手位置、侧栏开关、悬浮球位置。调整布局保存成功时清掉拖动记录，回到电脑上的位置。
+- **转屏**：`configChanges` 不重建 Activity；`ScreenFocusControls.onSizeChanged` 只按另一个方向的数据挪位置（`Ui.SOFT_SPRING` 280 ms），不重新搭视图。竖屏全屏时 `MainActivity.fitFocusedScreen` 把画面高度设成 宽 × 桌面高 / 桌面宽、贴在上面（「铺满屏幕」时占满）；根布局尺寸真的变了（`focusLayoutListener`）才重算，`onConfigurationChanged` 时尺寸还是旧的。
+- **键鼠条鼠标键**：精密模式点在箭头上（`ScreenView.leftClickAtCursor` 等）；自然触控、只看画面时发 `mouse` / `scroll`，点在电脑鼠标当前位置。
+- **快捷发送、发图片、配置兼容等（2026-11-12）**：
+  - **正式版能读开发版的配置**：`ModuleKind::Screen` 写进 config.json 时写成 `"kind":"touchpad"` + `"screen": true`（`Module.extra`，0.7.22 原样保留），读的时候两种写法都认；发给手机的 `phone_payload` 照旧是 `"screen"`。直接写 `"kind":"screen"` 的话，0.7.22 会把整份配置当坏文件、退回备份，同一台电脑上开发版、正式版轮着开时布局就丢了。测试里用 0.7.22 的解析器读过新写法。建议正式版以后碰到不认识的模块类型原样保留，不要整份当坏文件。
+  - **快捷发送**：V3 `slots.quickText`（只放 `button:`，参与「一处」，读的时候可以没有）；常用文本可选「打完按回车」= `Paste` + `Enter` 两步（正式版照样能执行），`keyEditor.editableText[].enter`；`keyEditorSave` 的 `createText` 带 `workbenchRow:"quickText"` 时同一次写配置放进这一排，新操作 `deleteText` 删按键并去掉工作台引用。
+  - **发图片**：手机动作 `fn:sendFile` = 主页「⋯ → 发文件到电脑」（`MainActivity.pickFiles`）。新布局默认在悬浮球第 8 格；已有布局靠 `screenWorkbenchV3Upgrades: ["sendFile"]` 补一次（有空格才放，用户以后拿掉不会再加回来）。
+  - **删按键不再拦**：`workbench::prune_missing` 在界面保存前、后台 `write_own` 前去掉指向已删按键的引用；V2 不再拦。
+  - **电脑「远程工作台」标签**（`pc/ui/src/workbench.rs` + `app.slint`）：每次改都过 `workbench::normalize`，走界面原来的撤销 / 自动保存。
+  - **手机**：全屏时提示改用最上层的提示卡片（以前 `say()` 写在被画面盖住的顶栏里，全屏时看不见）；全屏时不自动弹更新提示。竖屏按键页 `confirm=true` 的按键单击前也确认。
+  - **编码器**（`screen_h264.rs`）：ffmpeg 按 `SUANNIAO_FFMPEG` → exe 旁边的 `ffmpeg.exe` → PATH 找；第一次推流前按 h264_nvenc → h264_qsv → h264_amf → h264_mf（硬件、软件）→ libx264 试编码（合成画面，不抓桌面），用第一个能用的；都不行照旧退回 JPEG。所有编码器都先把帧下载到内存转 NV12（NVENC 拿不到核显上的纹理）。GOP 从约 0.5 秒改成约 1 秒（再长会碰上 4 秒的卡住检测）。
+  - **安装包带 ffmpeg**：打包时设 `SUANNIAO_PACK_FFMPEG=ffmpeg.exe 的路径`，装到 `SuanNIAO-core.exe` 旁边，卸载时删掉（`pc/ui/src/setup.rs` 的 `OPTIONAL_FILES`）。常见的 Windows 版 ffmpeg（比如 gyan.dev 的 full 版，带 libx264）是 GPL 的：随安装包分发要附 GPLv3 文本并提供源码；LGPL 版没有 libx264，CPU 兜底用 h264_mf 软件编码。不带 ffmpeg 时后台按上面的顺序找，找不到就退回 JPEG。
+- **工作台专用页、按键编号等（2026-11-12 第二批）**：
+  - **专用页藏起来**：工作台的热键、快捷发送放在 `remote-shortcuts` 页（`workbench::is_storage_page`）。`phone_payload` 给这页带 `"workbench": true`，手机普通布局和手机「调整布局」跳过它；电脑「布局」的页面标签、页数、「添加按键」的自动摆放（`free_spot`）也跳过它。以前它像普通页一样显示，用户把它删了，工作台里的键就跟着没了。
+  - **没人用的专用页按键自动删**：`workbench::collect_unused_storage_buttons` 只在工作台布局保存之后跑（后台保存 / 恢复默认、电脑「远程工作台」标签每次改）；「恢复默认」保留快捷发送那一排。
+  - **按键编号不再复用**：`Config::new_id` 用 `extra["idHighWater"]` 记发过的最大编号；合并配置时取较大的。以前删掉的编号会给下一个新键，用量统计、旧引用就对错了键。V2 只在第一次迁移时读。
+  - **布局有小毛病就地修**：`ensure()` 丢掉不认识的、重复的、超长的项，几何坏了按工具重置；只有结构完全不能用才重新生成，旧的先存到 `screenWorkbenchV3Previous`。
+  - **松开**：电脑全部松开（断线、局域网断开但蓝牙还连着、暂停、换方案、重载配置、看门狗）时也松开修饰键、画面按住的左键、切换应用按着的 Alt，并发 `{"t":"keysReleased"}`；手机收到后修饰键、「按住」都复位。手机发不出松开时改发 `{"t":"release"}`，一条连接都没有就等连上再发。
+  - **打完按回车**：`Paste` + 等 30 毫秒 + `Enter`，和预设「输入文本并回车」一样。新建的快捷发送、热键写进每个方案。
+  - **画面编码器**：后台启动就在后台试编码，选中的编码器出不了帧会重试一次。
+  - **电脑「远程工作台」标签**：按住拖着排顺序 / 换排 / 悬浮球里互换；「新建热键」用「映射」页同一个录制（`Recorder` / `record_key`），「新建常用文本」可选打完按回车，都放进点「＋」的那一排、一次撤销。
+  - **「电脑屏幕」按画面比例定高**：高 = 宽 × 格子宽高比 × 桌面高宽比，按 `SNAP` 取整。电脑用主显示器分辨率和手机预览的格子比例；手机「调整布局」用真实格子和画面流的桌面尺寸（没有就当 16:9）。
+  - **手机全屏**：横屏侧栏展开时画面往左让（只改画面变换，不改 TextureView 大小），竖屏侧栏放在画面下面；浮条、侧栏、切换应用条、编辑顶栏拦住空隙里的点击，不漏到画面上；提示卡片挪到下面、点击穿透；调整布局时按返回先问要不要放弃。
+- **侧栏、叠放、重连、开发版更新（2026-11-12 第三批）**：
+  - **侧栏塞进空白**：横屏按画面的实际位置算右边空白（`RailFit`），一列窄按钮竖直居中，画面不再往左挪（去掉了上一批的 endInset）；空白太窄、「铺满屏幕」开着时才盖在画面上。点任何一项做完就收起。
+  - **两条自动叠放**：两条都展开且重叠时只在显示上避让（`BarStacking`），不改用户拖出来的位置；竖条模式左右并排。
+  - **悬浮球四边吸**：松手吸最近的一条边，那一圈从 8 个方向里挑一个朝屏幕中间、不出屏幕的方向展开。双击悬浮球两条一起收 / 展（单击要等双击判定时间）。
+  - **侧栏开关**：「闲时半透明」（3 秒没碰降到 0.35）、「竖条」（两条竖排，展开区改成旁边弹出），存在手机上。
+  - **重连**：电脑地址变化约 1 秒内发现（Windows 地址变化通知），马上把 `lan` 发给每条连接（蓝牙优先）；电脑没网时发 `addrs` 为空的 `lan`，手机保留旧地址、显示「电脑的网络断了」，收到新地址立刻重连。手机前台重连间隔 1→2→4→5 秒（`LanRetryPolicy`）。
+  - **开发版的更新地址**：编译时指定 GitHub 仓库——电脑 `SUANNIAO_UPDATE_REPO=用户/仓库`（`option_env!`），手机 `-PupdateRepo=用户/仓库`（`BuildConfig.UPDATE_REPO`）。不指定就是 `drhhhao/SuanNIAO`，行为和以前一样。指定了别的仓库：只看那个仓库 GitHub 上的 latest.json，不走 Gitee；还没发过版本（404）当成已是最新；电脑上的更新记录单独存一份 `update-用户-仓库.json`。注意：有 `latest.json.sig` 就会用作者的公钥核对，fork 自己发版时不要传 `.sig`。
+- **代码**：`ScreenFocusControls`（组装、动作分发）、`WorkbenchEditor`（调整布局）、`HotkeyDialogs`（新建 / 改热键和常用文本，发 `keyEditorSave`）、`FloatingBar`、`WorkbenchBall`、`WorkbenchRail`、`FlowRow`、`WorkbenchTiles`；纯逻辑 `WorkbenchLayoutV3`、`WorkbenchCatalog`、`WorkbenchRef`、`BallRingLayout`、`ModifierLatch`、`TapTriggers`、`WorkbenchSession`，都有单元测试。
+
 ## 本地语音识别
 
 - **引擎**：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 2.0.1（`android/app/libs/sherpa-onnx-2.0.1.aar`，只打包 arm64）。

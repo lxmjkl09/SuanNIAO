@@ -154,6 +154,31 @@ export struct MapRow {
     count: int,
 }
 
+// 布局页「远程工作台」里的一个按钮：悬浮球的一格，或者某一排里的一个
+export struct WbChip {
+    // 引用：fn:…（手机动作）/ key:…（基础键）/ button:…（正式版按键）；悬浮球的空格是空的
+    token: string,
+    label: string,
+    // 菜单标题下面的小字：「手机动作」「正式版按键 · 按之前先确认」
+    detail: string,
+    // 语音、键鼠、精密鼠标：锁着，只能挪位置
+    fixed: bool,
+    // 常用文本打完按回车：字后面画个回车
+    enter: bool,
+}
+
+// 工作台按钮的菜单、按钮库里的一行：分组标题，或者点了做 action 的一项（Rust 给、Rust 认）
+export struct WbItem {
+    header: bool,
+    text: string,
+    // 右边的小字：「在：悬浮球」「在这一排」「没有空位」
+    note: string,
+    action: string,
+    enabled: bool,
+    // 「拿掉」：红字
+    danger: bool,
+}
+
 // 下拉框选项，由 Rust 填入，和配置里的取值一一对应
 export global Lists {
     in property <[string]> action-kinds;
@@ -623,7 +648,7 @@ component KeyCap inherits Rectangle {
 
 // 按键的彩色图标块：图标按动作挑（回车、删除、方向键……），没有合适图标的写两三个字（Esc、^C、F5）
 component KeyTile inherits Rectangle {
-    // button / touchpad / voice / voiceButton
+    // button / touchpad / voice / voiceButton / screen
     in property <string> kind: "button";
     in property <string> icon;
     in property <string> glyph;
@@ -635,7 +660,7 @@ component KeyTile inherits Rectangle {
     border-radius: root.size * 0.28;
     background: Theme.tone-bg(root.shade);
     if root.kind != "button" || root.glyph == "": Icon {
-        source: root.kind == "touchpad" ? @image-url("../icons/pad.svg") : root.kind == "voiceButton" ? @image-url("../icons/mic.svg") : root.kind == "voice" ? @image-url("../icons/text.svg") : Icons.get(root.icon);
+        source: root.kind == "touchpad" ? @image-url("../icons/pad.svg") : root.kind == "voiceButton" ? @image-url("../icons/mic.svg") : root.kind == "voice" ? @image-url("../icons/text.svg") : root.kind == "screen" ? @image-url("../icons/win-max.svg") : Icons.get(root.icon);
         tint: Theme.tone-fg(root.shade);
         size: root.size * 0.5;
     }
@@ -1129,6 +1154,9 @@ component KeyPicker inherits Rectangle {
     in property <string> shown;
     in property <int> current-row: -1;
     in property <bool> invalid;
+    // 还没选时写的字；quiet：不标红（「新建热键」里从列表选主键，不选也行）
+    in property <string> placeholder: "请选择按键";
+    in property <bool> quiet: false;
     callback selected(int);
     height: 34px;
     min-width: 80px;
@@ -1141,8 +1169,8 @@ component KeyPicker inherits Rectangle {
         x: 11px;
         width: parent.width - 36px;
         height: parent.height;
-        text: root.shown == "" ? "请选择按键" : root.shown;
-        color: root.shown == "" ? Theme.red : Theme.fg;
+        text: root.shown == "" ? root.placeholder : root.shown;
+        color: root.shown == "" ? (root.quiet ? Theme.mut : Theme.red) : Theme.fg;
         font-size: 13px;
         vertical-alignment: center;
         overflow: elide;
@@ -1427,6 +1455,21 @@ component PhonePreview inherits Rectangle {
             text: "触控板";
             color: Theme.phone-mut;
             font-size: 8px;
+        }
+        if m.kind == "screen": Rectangle {
+            x: 4px;
+            y: 4px;
+            width: parent.width - 8px;
+            height: parent.height - 8px;
+            border-radius: 4px;
+            background: #192636;
+            Text {
+                text: "电脑屏幕";
+                color: #d5e2f1;
+                font-size: 8px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
         }
         if m.kind == "voiceButton" || m.kind == "voice": VerticalLayout {
             alignment: center;
@@ -2407,6 +2450,466 @@ component PageTab inherits Rectangle {
     }
 }
 
+// 虚线框（工作台的空格、「＋」）：Slint 画不了虚线边框，沿四条边画一段段短线，四个角空着当圆角
+component DashedFrame inherits Rectangle {
+    in property <color> line-color: Theme.line2;
+    property <length> inset: 6px;
+    property <length> dash: 4px;
+    property <length> gap: 3px;
+    property <int> nx: Math.max(0, Math.floor((self.width - 2 * self.inset + self.gap) / (self.dash + self.gap)));
+    property <int> ny: Math.max(0, Math.floor((self.height - 2 * self.inset + self.gap) / (self.dash + self.gap)));
+    // 短线整体居中，两头留的一样多
+    property <length> ox: (self.width - self.nx * self.dash - Math.max(0, self.nx - 1) * self.gap) / 2;
+    property <length> oy: (self.height - self.ny * self.dash - Math.max(0, self.ny - 1) * self.gap) / 2;
+    for i in root.nx: Rectangle {
+        x: root.ox + i * (root.dash + root.gap);
+        y: 0;
+        width: root.dash;
+        height: 1px;
+        background: root.line-color;
+    }
+    for i in root.nx: Rectangle {
+        x: root.ox + i * (root.dash + root.gap);
+        y: root.height - 1px;
+        width: root.dash;
+        height: 1px;
+        background: root.line-color;
+    }
+    for i in root.ny: Rectangle {
+        x: 0;
+        y: root.oy + i * (root.dash + root.gap);
+        width: 1px;
+        height: root.dash;
+        background: root.line-color;
+    }
+    for i in root.ny: Rectangle {
+        x: root.width - 1px;
+        y: root.oy + i * (root.dash + root.gap);
+        width: 1px;
+        height: root.dash;
+        background: root.line-color;
+    }
+}
+
+// 远程工作台里拖按钮排顺序（见 WbChipView）：拖的是谁、鼠标在哪、松手放到哪。
+// 按钮、各节自己看鼠标在不在身上，在就把位置报上来；能不能放问 Rust（check），松手交给 Rust（drop-at）
+export global WbDrag {
+    // 正在拖（按下以后移动超过 6 像素才算）
+    in-out property <bool> active;
+    // 拖的是哪一处（0 悬浮球、1 快捷发送、2 语音条编辑、3 键鼠条、4 侧栏）的第几个，拖起来那一刻它是什么
+    in-out property <int> from-place: -1;
+    in-out property <int> from-index: -1;
+    in-out property <string> token;
+    in-out property <string> label;
+    // 鼠标在窗口里的位置
+    in-out property <length> x;
+    in-out property <length> y;
+    // 压在哪个按钮上：哪一处、悬浮球的第几格或者插在第几个前面；owner 是报这个的按钮（离开时只清自己报的）
+    in-out property <int> to-place: -1;
+    in-out property <int> to-index: -1;
+    in-out property <string> owner;
+    // 鼠标在哪一节上（没压在按钮上时，松手放到这一节最后、悬浮球的第一个空格）
+    in-out property <int> area: -1;
+    // 松手放到哪：place 是 -1 就哪都不放；index 是 -1 就放到这一节最后（悬浮球是第一个空格）
+    out property <int> place: root.to-place >= 0 ? root.to-place : root.area;
+    out property <int> index: root.to-place >= 0 ? root.to-index : -1;
+    // 能不能放：空的就能放；「=」是放回原处、不用改；别的是放不了的原因（Rust 按工作台的规则算）
+    out property <string> problem: root.active && root.place >= 0 ? root.check(root.from-place, root.from-index, root.token, root.place, root.index) : "=";
+    pure callback check(int, int, string, int, int) -> string;
+    callback drop-at(int, int, string, int, int);
+}
+
+// 远程工作台里的一个按钮。点开菜单：往前挪、移到…、换成别的…、改映射、拿掉（固定的只能挪位置）；
+// 悬浮球的空格、各排后面的「＋」直接点开按钮库。菜单和按钮库点开那一刻才问 Rust 要，拿到的是最新的；
+// 点开那一刻这里放的是什么也记下（opened），点了菜单里的哪一项就拿它去做：这期间被别处改过、这一格换成了别的，
+// Rust 按 opened 找它现在在哪，不会改到别的按钮上（审查 #6）。
+// 按住拖（移动超过 6 像素才算拖，不然还是点开菜单）：排顺序、搬到别的排。拖着经过的按钮自己看鼠标在不在身上，
+// 在就把「松手放到哪」报给 WbDrag，再画出插入线（悬浮球是把那一格框起来），放不了画成红的
+component WbChipView inherits Rectangle {
+    in property <WbChip> chip;
+    // 「＋」：加到这一排最后
+    in property <bool> add: false;
+    // 在哪一处（0 悬浮球、1 快捷发送、2 语音条编辑、3 键鼠条、4 侧栏）、第几个（「＋」是这一排有几个）
+    in property <int> place: -1;
+    in property <int> index: -1;
+    callback request-menu() -> [WbItem];
+    callback request-library() -> [WbItem];
+    // 菜单、按钮库里点了一项：点开那一刻这里是什么、要做什么（Rust 按 action 去改）
+    callback act(string, string);
+    property <bool> blank: root.add || root.chip.token == "";
+    property <[WbItem]> menu-items;
+    property <[WbItem]> lib-items;
+    // 点开菜单、按钮库那一刻这里放的是什么
+    property <string> opened;
+    // 点了的那一项：等弹出框关掉再由 later 去做（做完这个按钮可能就没了，或者要换成按钮库）
+    property <string> pending;
+    property <bool> waiting: false;
+    // 这一次按下以后拖过：松手不算点了一下，不开菜单
+    property <bool> moved-away: false;
+    // 自己正被拖着
+    property <bool> dragging: WbDrag.active && !root.blank && WbDrag.from-place == root.place && WbDrag.from-index == root.index;
+    // 拖别的按钮时鼠标压没压在我身上：四边各多算几个像素，按钮之间的空隙也算进来
+    property <length> ax: root.absolute-position.x;
+    property <length> ay: root.absolute-position.y;
+    property <bool> over: WbDrag.active && root.place >= 0 && WbDrag.x >= root.ax - 3px && WbDrag.x < root.ax + root.width + 3px && WbDrag.y >= root.ay - 4px && WbDrag.y < root.ay + root.height + 4px;
+    // 各排：压在左半边就插在我前面（0），右半边插在我后面（1）；悬浮球、「＋」只有一个位置
+    property <int> hit: !root.over ? -1 : (root.place == 0 || root.add) ? 0 : WbDrag.x < root.ax + root.width / 2 ? 0 : 1;
+    property <string> me: root.place + ":" + root.index;
+    changed hit => {
+        if (root.hit >= 0) {
+            WbDrag.to-place = root.place;
+            WbDrag.to-index = root.index + root.hit;
+            WbDrag.owner = root.me;
+        } else if (WbDrag.owner == root.me) {
+            WbDrag.to-place = -1;
+            WbDrag.to-index = -1;
+            WbDrag.owner = "";
+        }
+    }
+    // 松手会放到我这里（我报的，而且不是放回原处）：画插入线、框。
+    // 没压在按钮上、要放到这一排最后：在「＋」前面画插入线
+    property <bool> target: WbDrag.active && WbDrag.owner == root.me && WbDrag.problem != "=";
+    property <bool> tail: root.add && WbDrag.active && WbDrag.to-place < 0 && WbDrag.area == root.place && WbDrag.problem != "=";
+    property <color> mark: WbDrag.problem == "" ? Theme.ink : Theme.red;
+    width: chip-text.preferred-width + 24px + (root.chip.fixed ? 17px : 0px) + (root.chip.enter ? 17px : 0px);
+    height: 30px;
+    border-radius: 9px;
+    background: root.blank ? (area.has-hover ? Theme.hover : transparent) : area.pressed && !root.dragging ? Theme.line2 : area.has-hover ? Theme.line : Theme.tone-bg(0);
+    // 被拖走的那个原地留个淡影
+    opacity: root.dragging ? 0.35 : 1;
+    animate background { duration: 150ms; }
+    animate opacity { duration: 120ms; }
+    // 悬浮球：把要放进去的那一格框起来（两个换位置，或者放进空格）
+    if root.target && root.place == 0: Rectangle {
+        x: -3px;
+        y: -3px;
+        width: root.width + 6px;
+        height: root.height + 6px;
+        border-radius: 11px;
+        border-width: 2px;
+        border-color: root.mark;
+        background: WbDrag.problem == "" ? Theme.lime.with-alpha(0.35) : Theme.red.with-alpha(0.08);
+    }
+    // 各排的插入线：插在前面就画在左边的空隙里，插在后面画在右边
+    if (root.target && root.place != 0) || root.tail: Rectangle {
+        x: root.hit == 1 && !root.tail ? root.width + 1.5px : -4.5px;
+        y: -5px;
+        width: 3px;
+        height: root.height + 10px;
+        border-radius: 1.5px;
+        background: root.mark;
+    }
+    if root.blank: DashedFrame {
+        width: 100%;
+        height: 100%;
+        line-color: area.has-hover ? Theme.mut : Theme.mut.with-alpha(0.55);
+    }
+    if root.chip.fixed: Icon {
+        x: 11px;
+        size: 13px;
+        source: @image-url("../icons/lock.svg");
+        tint: Theme.mut;
+    }
+    chip-text := Text {
+        x: root.chip.fixed ? 29px : 12px;
+        height: parent.height;
+        text: root.add ? "＋" : root.chip.token == "" ? "空" : root.chip.label;
+        color: root.blank ? Theme.mut : root.chip.fixed ? Theme.fg2 : Theme.fg;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    if root.chip.enter: Icon {
+        x: chip-text.x + chip-text.preferred-width + 4px;
+        size: 13px;
+        source: @image-url("../icons/enter.svg");
+        tint: Theme.mut;
+    }
+    area := TouchArea {
+        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.pointer;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                if (event.button == PointerEventButton.left) {
+                    root.moved-away = false;
+                }
+            } else if (event.kind == PointerEventKind.move) {
+                // 按着移动超过 6 像素：开始拖（空格、「＋」不能拖）
+                if (self.pressed && !root.blank && root.place >= 0 && !root.dragging && Math.abs(self.mouse-x - self.pressed-x) + Math.abs(self.mouse-y - self.pressed-y) > 6px) {
+                    root.moved-away = true;
+                    WbDrag.from-place = root.place;
+                    WbDrag.from-index = root.index;
+                    WbDrag.token = root.chip.token;
+                    WbDrag.label = root.chip.label;
+                    WbDrag.to-place = -1;
+                    WbDrag.to-index = -1;
+                    WbDrag.owner = "";
+                    WbDrag.area = -1;
+                    WbDrag.active = true;
+                }
+                if (root.dragging) {
+                    WbDrag.x = self.absolute-position.x + self.mouse-x;
+                    WbDrag.y = self.absolute-position.y + self.mouse-y;
+                }
+            } else if (event.kind == PointerEventKind.up) {
+                // 松手：放回原处什么都不做；别的交给 Rust（能放就放，放不了它会说原因）
+                if (root.dragging) {
+                    let to-place = WbDrag.place;
+                    let to-index = WbDrag.index;
+                    let problem = WbDrag.problem;
+                    WbDrag.active = false;
+                    if (to-place >= 0 && problem != "=") {
+                        WbDrag.drop-at(WbDrag.from-place, WbDrag.from-index, WbDrag.token, to-place, to-index);
+                    }
+                }
+            } else if (event.kind == PointerEventKind.cancel) {
+                if (root.dragging) {
+                    WbDrag.active = false;
+                }
+            }
+        }
+        clicked => {
+            // 刚才是拖，不算点了一下
+            if (!root.moved-away) {
+                root.opened = root.chip.token;
+                if (root.blank) {
+                    root.lib-items = root.request-library();
+                    lib.show();
+                } else {
+                    root.menu-items = root.request-menu();
+                    menu.show();
+                }
+            }
+        }
+    }
+    later := Timer {
+        interval: 1ms;
+        running: root.waiting;
+        triggered => {
+            root.waiting = false;
+            if (root.pending == "replace") {
+                root.lib-items = root.request-library();
+                lib.show();
+            } else {
+                root.act(root.opened, root.pending);
+            }
+        }
+    }
+    menu := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: 236px;
+        height: 60px + root.menu-items.length * 32px;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        Rectangle {
+            property <bool> shown: false;
+            init => {
+                self.shown = true;
+            }
+            opacity: self.shown ? 1 : 0;
+            y: self.shown ? 0px : -4px;
+            animate opacity, y { duration: Motion.quick; easing: ease-out; }
+            background: Theme.win;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line2;
+            VerticalLayout {
+                padding: 6px;
+                alignment: start;
+                // 标题：按钮的名字，下面一行小字说它是什么
+                VerticalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 6px;
+                    padding-bottom: 8px;
+                    spacing: 2px;
+                    Text {
+                        text: root.chip.label;
+                        color: Theme.fg;
+                        font-size: 13px;
+                        font-weight: 700;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.chip.detail;
+                        color: Theme.mut;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
+                }
+                for item in root.menu-items: Rectangle {
+                    height: 32px;
+                    border-radius: 8px;
+                    background: item.enabled && pick.has-hover ? Theme.hover : transparent;
+                    note-text := Text {
+                        x: parent.width - self.width - 10px;
+                        height: parent.height;
+                        text: item.note;
+                        color: Theme.mut;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        x: 10px;
+                        width: parent.width - 28px - note-text.width;
+                        height: parent.height;
+                        text: item.text;
+                        color: !item.enabled ? Theme.mut : item.danger ? Theme.red : Theme.fg;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    pick := TouchArea {
+                        enabled: item.enabled;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.pending = item.action;
+                            root.waiting = true;
+                            menu.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    lib := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: 290px;
+        height: Math.min(400px, root.lib-items.length * 30px + 10px);
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        Rectangle {
+            property <bool> shown: false;
+            init => {
+                self.shown = true;
+            }
+            opacity: self.shown ? 1 : 0;
+            y: self.shown ? 0px : -4px;
+            animate opacity, y { duration: Motion.quick; easing: ease-out; }
+            background: Theme.win;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line2;
+            list := Flickable {
+                x: 1px;
+                y: 1px;
+                width: parent.width - 2px;
+                height: parent.height - 2px;
+                content-height: root.lib-items.length * 30px + 8px;
+                for item[i] in root.lib-items: Rectangle {
+                    x: 4px;
+                    y: 4px + i * 30px;
+                    width: parent.width - 8px;
+                    height: 30px;
+                    border-radius: 7px;
+                    background: !item.header && item.enabled && option.has-hover ? Theme.hover : transparent;
+                    // 分组之间画一条细线隔开（第一组不画）
+                    if item.header && i > 0: Rectangle {
+                        x: 4px;
+                        y: 6px;
+                        width: parent.width - 8px;
+                        height: 1px;
+                        background: Theme.line;
+                    }
+                    lib-note := Text {
+                        x: parent.width - self.width - 10px;
+                        height: parent.height;
+                        text: item.note;
+                        color: Theme.mut;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        x: item.header ? 8px : 12px;
+                        width: parent.width - (item.header ? 16px : 30px) - lib-note.width;
+                        height: parent.height;
+                        text: item.text;
+                        color: item.header || !item.enabled ? Theme.mut : Theme.fg;
+                        font-size: item.header ? 11.5px : 13px;
+                        font-weight: item.header ? 600 : 400;
+                        vertical-alignment: item.header ? bottom : center;
+                        overflow: elide;
+                    }
+                    option := TouchArea {
+                        enabled: !item.header && item.enabled;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.pending = item.action;
+                            root.waiting = true;
+                            lib.close();
+                        }
+                    }
+                }
+            }
+            // 下面还有没露出来的项：底部渐隐
+            if list.content-height + list.content-y > list.height + 4px: Rectangle {
+                x: 1px;
+                y: parent.height - 30px;
+                width: parent.width - 2px;
+                height: 29px;
+                border-radius: 11px;
+                background: @linear-gradient(180deg, Theme.win.with-alpha(0) 0%, Theme.win 85%);
+                Icon {
+                    x: (parent.width - 14px) / 2;
+                    y: 12px;
+                    source: @image-url("../icons/chev.svg");
+                    tint: Theme.mut;
+                    size: 14px;
+                }
+            }
+        }
+    }
+}
+
+// 工作台编辑里的一节：标题和一行小字，下面一排按钮（会折行）。
+// 拖着按钮经过这一节又没压在哪个按钮上：松手放到这一节最后（悬浮球是第一个空格），整节淡淡地亮一下（放不了是淡红）
+component WbSection inherits Rectangle {
+    in property <string> title;
+    in property <string> note;
+    // 第几处（0 悬浮球 … 4 侧栏），拖的时候认地方用
+    in property <int> place: -1;
+    property <bool> area-hit: WbDrag.active && root.place >= 0 && WbDrag.x >= root.absolute-position.x - 6px && WbDrag.x < root.absolute-position.x + root.width + 6px && WbDrag.y >= root.absolute-position.y - 6px && WbDrag.y < root.absolute-position.y + root.height + 6px;
+    changed area-hit => {
+        if (root.area-hit) {
+            WbDrag.area = root.place;
+        } else if (WbDrag.area == root.place) {
+            WbDrag.area = -1;
+        }
+    }
+    property <bool> lit: WbDrag.active && WbDrag.to-place < 0 && WbDrag.area == root.place && WbDrag.problem != "=";
+    Rectangle {
+        x: -7px;
+        y: -7px;
+        width: parent.width + 14px;
+        height: parent.height + 14px;
+        border-radius: 10px;
+        background: !root.lit ? transparent : WbDrag.problem == "" ? Theme.lime.with-alpha(0.3) : Theme.red.with-alpha(0.07);
+        animate background { duration: 120ms; }
+    }
+    VerticalLayout {
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Text {
+                text: root.title;
+                color: Theme.fg;
+                font-size: 14px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.note;
+                color: Theme.mut;
+                font-size: 11.5px;
+                vertical-alignment: center;
+                overflow: elide;
+                min-width: 0px;
+                horizontal-stretch: 1;
+            }
+        }
+        @children
+    }
+}
+
 component LayoutPage inherits Page {
     in property <[string]> page-names;
     in property <int> page-index;
@@ -2426,6 +2929,23 @@ component LayoutPage inherits Page {
     in-out property <string> page-name;
     // 手机画面多高：按窗口高度算好，整部手机一屏放得下
     in property <length> canvas-height: 694px;
+    // 「远程工作台」标签：选中时下面换成工作台（手机进「电脑屏幕」全屏时用的按钮），不显示手机画面和模块属性；
+    // 点回哪一页的标签就回到那一页
+    in property <bool> wb-open;
+    // 有没有能编辑的工作台布局（后台还没生成过、或者坏了时是 false）
+    in property <bool> wb-ready;
+    in property <[WbChip]> wb-ball;
+    in property <[WbChip]> wb-quick;
+    in property <[WbChip]> wb-voice;
+    in property <[WbChip]> wb-keymouse;
+    in property <[WbChip]> wb-rail;
+    callback open-workbench();
+    callback wb-create();
+    // 工作台里的五处：0 悬浮球、1 快捷发送、2 语音条编辑、3 键鼠条、4 侧栏；第几个（-1 是后面的「＋」）
+    callback wb-menu(int, int) -> [WbItem];
+    callback wb-library(int, int) -> [WbItem];
+    // 点了菜单、按钮库里的一项：哪一处、第几个、点开时那里是什么（Rust 核对没被别处改过）、做什么
+    callback wb-act(int, int, string, string);
     callback select-page(int);
     callback add-page();
     callback rename-page(string);
@@ -2496,7 +3016,7 @@ component LayoutPage inherits Page {
             cross-axis-alignment: center;
             for name[i] in root.page-names: PageTab {
                 text: name;
-                selected: i == root.page-index;
+                selected: !root.wb-open && i == root.page-index;
                 clicked => {
                     root.select-page(i);
                 }
@@ -2530,8 +3050,272 @@ component LayoutPage inherits Page {
                     }
                 }
             }
+            // 竖线隔开：工作台不是一页，是手机进「电脑屏幕」全屏时用的那套按钮
+            Rectangle {
+                width: 13px;
+                height: 32px;
+                Rectangle {
+                    x: 6px;
+                    y: 6px;
+                    width: 1px;
+                    height: 20px;
+                    background: Theme.line2;
+                }
+            }
+            Rectangle {
+                height: 32px;
+                width: wb-tab-text.preferred-width + 49px;
+                border-radius: 16px;
+                background: root.wb-open ? Theme.ink : wb-tab.has-hover ? Theme.hover : Theme.win;
+                border-width: root.wb-open ? 0px : 1px;
+                border-color: Theme.line2;
+                animate background { duration: 200ms; }
+                Icon {
+                    x: 14px;
+                    size: 15px;
+                    source: @image-url("../icons/screen-phone.svg");
+                    tint: root.wb-open ? Theme.ink-fg : Theme.fg;
+                }
+                wb-tab-text := Text {
+                    x: 35px;
+                    height: parent.height;
+                    text: "远程工作台";
+                    color: root.wb-open ? Theme.ink-fg : Theme.fg;
+                    font-size: 13px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+                wb-tab := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.open-workbench();
+                    }
+                }
+            }
         }
-        HorizontalLayout {
+        if root.wb-open: VerticalLayout {
+            spacing: 12px;
+            Rectangle {
+                background: Theme.soft;
+                border-radius: 10px;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    WrapText {
+                        text: "手机进「电脑屏幕」全屏时用的按钮。这里管放什么、什么顺序：点按钮改，按住拖着排顺序、拖到别的排；位置和大小在手机上「调整布局」里拖。改了自动保存，手机马上跟着变，Ctrl+Z 撤销。";
+                        color: Theme.fg2;
+                        font-size: 12.5px;
+                    }
+                }
+            }
+            if !root.wb-ready: Card {
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    alignment: start;
+                    Muted {
+                        text: "还没有工作台布局：蒜鸟后台启动时会自动生成。也可以现在生成默认的（语音、键鼠、精密鼠标、常用热键……），生成以后可以撤销。";
+                        font-size: 13px;
+                    }
+                    HorizontalLayout {
+                        alignment: start;
+                        PrimaryButton {
+                            text: "生成默认布局";
+                            clicked => {
+                                root.wb-create();
+                            }
+                        }
+                    }
+                }
+            }
+            if root.wb-ready: HorizontalLayout {
+                spacing: 14px;
+                Card {
+                    width: 330px;
+                    VerticalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        alignment: start;
+                        WbSection {
+                            title: "悬浮球";
+                            note: "8 个位置 · 带锁的固定在球里";
+                            place: 0;
+                            FlexboxLayout {
+                                spacing: 6px;
+                                cross-axis-alignment: center;
+                                for c[i] in root.wb-ball: WbChipView {
+                                    chip: c;
+                                    place: 0;
+                                    index: i;
+                                    request-menu => {
+                                        return root.wb-menu(0, i);
+                                    }
+                                    request-library => {
+                                        return root.wb-library(0, i);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(0, i, t, a);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Card {
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    VerticalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        spacing: 16px;
+                        alignment: start;
+                        WbSection {
+                            title: "语音条 · 快捷发送";
+                            note: "点一下打进电脑";
+                            place: 1;
+                            FlexboxLayout {
+                                spacing: 6px;
+                                cross-axis-alignment: center;
+                                for c[i] in root.wb-quick: WbChipView {
+                                    chip: c;
+                                    place: 1;
+                                    index: i;
+                                    request-menu => {
+                                        return root.wb-menu(1, i);
+                                    }
+                                    request-library => {
+                                        return root.wb-library(1, i);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(1, i, t, a);
+                                    }
+                                }
+                                WbChipView {
+                                    add: true;
+                                    place: 1;
+                                    index: root.wb-quick.length;
+                                    request-library => {
+                                        return root.wb-library(1, -1);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(1, -1, "", a);
+                                    }
+                                }
+                            }
+                        }
+                        WbSection {
+                            title: "语音条 · 编辑";
+                            note: "改字用的键";
+                            place: 2;
+                            FlexboxLayout {
+                                spacing: 6px;
+                                cross-axis-alignment: center;
+                                for c[i] in root.wb-voice: WbChipView {
+                                    chip: c;
+                                    place: 2;
+                                    index: i;
+                                    request-menu => {
+                                        return root.wb-menu(2, i);
+                                    }
+                                    request-library => {
+                                        return root.wb-library(2, i);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(2, i, t, a);
+                                    }
+                                }
+                                WbChipView {
+                                    add: true;
+                                    place: 2;
+                                    index: root.wb-voice.length;
+                                    request-library => {
+                                        return root.wb-library(2, -1);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(2, -1, "", a);
+                                    }
+                                }
+                            }
+                        }
+                        WbSection {
+                            title: "键鼠条 · 按键";
+                            note: "Ctrl Shift Alt Win 固定在上面一行";
+                            place: 3;
+                            FlexboxLayout {
+                                spacing: 6px;
+                                cross-axis-alignment: center;
+                                for c[i] in root.wb-keymouse: WbChipView {
+                                    chip: c;
+                                    place: 3;
+                                    index: i;
+                                    request-menu => {
+                                        return root.wb-menu(3, i);
+                                    }
+                                    request-library => {
+                                        return root.wb-library(3, i);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(3, i, t, a);
+                                    }
+                                }
+                                WbChipView {
+                                    add: true;
+                                    place: 3;
+                                    index: root.wb-keymouse.length;
+                                    request-library => {
+                                        return root.wb-library(3, -1);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(3, -1, "", a);
+                                    }
+                                }
+                            }
+                        }
+                        WbSection {
+                            title: "侧栏 · 我的按钮";
+                            note: root.wb-rail.length == 0 ? "还没有" : "";
+                            place: 4;
+                            FlexboxLayout {
+                                spacing: 6px;
+                                cross-axis-alignment: center;
+                                for c[i] in root.wb-rail: WbChipView {
+                                    chip: c;
+                                    place: 4;
+                                    index: i;
+                                    request-menu => {
+                                        return root.wb-menu(4, i);
+                                    }
+                                    request-library => {
+                                        return root.wb-library(4, i);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(4, i, t, a);
+                                    }
+                                }
+                                WbChipView {
+                                    add: true;
+                                    place: 4;
+                                    index: root.wb-rail.length;
+                                    request-library => {
+                                        return root.wb-library(4, -1);
+                                    }
+                                    act(t, a) => {
+                                        root.wb-act(4, -1, "", a);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !root.wb-open: HorizontalLayout {
             spacing: 16px;
             // 画布：和手机一样的外观，按窗口高度缩放
             Card {
@@ -2626,7 +3410,22 @@ component LayoutPage inherits Page {
                                 font-size: 11px;
                                 font-weight: 700;
                             }
-                            if m.kind != "touchpad": VerticalLayout {
+                            if m.kind == "screen": Rectangle {
+                                x: 6px;
+                                y: 6px;
+                                width: parent.width - 12px;
+                                height: parent.height - 12px;
+                                border-radius: 6px;
+                                background: #192636;
+                                Text {
+                                    text: "电脑屏幕";
+                                    color: #d5e2f1;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            if m.kind != "touchpad" && m.kind != "screen": VerticalLayout {
                                 alignment: center;
                                 spacing: 4px;
                                 if m.kind != "button" || Keys.drawn(m.label): HorizontalLayout {
@@ -2639,7 +3438,7 @@ component LayoutPage inherits Page {
                                 }
                                 // 不到一格高的图标键只留图标；图标下面的小字放不下就省略
                                 if (m.kind == "button" && !Keys.drawn(m.label)) || m.h * canvas.cell-h > 60px: Text {
-                                    text: m.kind == "button" && Keys.drawn(m.label) && (m.label == "↑" || m.label == "↓" || m.label == "←" || m.label == "→") ? "" : m.kind == "button" ? m.label : m.kind == "voice" ? "语音输入框" : "语音按钮";
+                                    text: m.kind == "button" && Keys.drawn(m.label) && (m.label == "↑" || m.label == "↓" || m.label == "←" || m.label == "→") ? "" : m.kind == "button" ? m.label : m.kind == "voice" ? "语音输入框" : m.kind == "screen" ? "电脑屏幕" : "语音按钮";
                                     color: m.kind == "button" && !Keys.drawn(m.label) ? Theme.phone-fg : Theme.phone-mut;
                                     font-size: m.kind == "button" && !Keys.drawn(m.label) ? (m.w * canvas.cell-w < 52px ? 11px : 14px) : 10.5px;
                                     font-weight: 700;
@@ -2787,7 +3586,7 @@ component LayoutPage inherits Page {
                             if root.selected >= 0: VerticalLayout {
                                 alignment: center;
                                 Chip {
-                                    text: root.sel-kind == 0 ? "按键" : root.sel-kind == 1 ? "触控板" : root.sel-kind == 2 ? "语音输入框" : "语音按钮";
+                                    text: root.sel-kind == 0 ? "按键" : root.sel-kind == 1 ? "触控板" : root.sel-kind == 2 ? "语音输入框" : root.sel-kind == 3 ? "语音按钮" : "电脑屏幕";
                                 }
                             }
                         }
@@ -2815,7 +3614,7 @@ component LayoutPage inherits Page {
                                     vertical-alignment: center;
                                 }
                                 Select {
-                                    model: ["按键", "触控板", "语音输入框", "语音按钮"];
+                                    model: ["按键", "触控板", "语音输入框", "语音按钮", "电脑屏幕"];
                                     current-index: root.sel-kind;
                                     selected(k) => {
                                         root.kind-changed(k);
@@ -3898,6 +4697,477 @@ component NameDialog inherits DialogCard {
     }
 }
 
+// 勾选框：受控（自己不改状态，点了报告想要的新状态）。note 是后面一行淡淡的说明
+component TickBox inherits Rectangle {
+    in property <bool> checked;
+    in property <string> text;
+    in property <string> note;
+    callback toggled(bool);
+    height: 30px;
+    HorizontalLayout {
+        spacing: 9px;
+        alignment: start;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                border-width: root.checked ? 0px : 1.5px;
+                border-color: tick.has-hover ? Theme.mut : Theme.line2;
+                background: root.checked ? Theme.ink : Theme.win;
+                animate background { duration: 150ms; }
+                if root.checked: Icon {
+                    source: @image-url("../icons/check.svg");
+                    tint: Theme.ink-fg;
+                    size: 13px;
+                }
+            }
+        }
+        Text {
+            text: root.text;
+            color: Theme.fg;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+        if root.note != "": Text {
+            text: root.note;
+            color: Theme.mut;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+            min-width: 0px;
+            horizontal-stretch: 1;
+        }
+    }
+    tick := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.toggled(!root.checked);
+        }
+    }
+}
+
+// 远程工作台按钮库里的「＋ 新建热键」：名字、按键、按之前先确认。按键可以「录制」（和映射页的录制一样，按下就填进去），
+// 也可以照「按键」下拉框里的名字写（Ctrl+S），或者从列表里选主键。点「新建」建一个正式版按键（放在工作台专用页，
+// 布局页不显示），放到点开按钮库的那一格。双击、长按、多步这些点「去映射页细调」：建好就跳过去
+component WbHotkeyDialog inherits DialogCard {
+    // 建好放到哪（「建好放到「键鼠条」最后」）
+    in property <string> where;
+    in-out property <string> combo;
+    // 名字、按键、按之前先确认、建好去不去映射页
+    callback save(string, string, bool, bool);
+    callback cancel();
+    // 录按键：交给 Rust（和映射页一样），返回 0 接着录、1 录好了（已经填进 combo）、2 取消
+    callback record-key(string, bool, bool, bool, bool, bool) -> int;
+    // 按键那一栏哪里不对（空的就是没问题）
+    pure callback problem(string) -> string;
+    // 按键里的主键在下拉框里叫什么
+    pure callback main-key(string) -> string;
+    // 从下拉框选了一个键：换掉主键（选的是修饰键就加上去）
+    pure callback pick-key(string, int) -> string;
+    property <bool> confirm: false;
+    property <bool> recording: false;
+    property <string> issue: root.problem(root.combo);
+    card-width: 540px;
+    card-height: 404px;
+    // 点遮罩不关（会丢掉填的字），Esc 关；正在录的时候 Esc 只是不录了
+    dismissable: false;
+    focus-self: false;
+    dismiss => {
+        if (root.recording) {
+            root.stop-recording();
+            name-input.focus();
+        } else {
+            root.cancel();
+        }
+    }
+    function start-recording() {
+        Recorder.hint = "";
+        Recorder.active = true;
+        root.recording = true;
+    }
+    // 不录了：让 Rust 也忘掉录到一半的修饰键（和录的时候按 Esc 一样）
+    function stop-recording() {
+        if (root.recording) {
+            root.record-key(Key.Escape, false, false, false, false, true);
+        }
+        Recorder.active = false;
+        root.recording = false;
+    }
+    // 录好了、取消了：焦点回到名字（Esc 还能关对话框）
+    function recorded() {
+        Recorder.active = false;
+        root.recording = false;
+        name-input.focus();
+    }
+    VerticalLayout {
+        padding: 22px;
+        spacing: 14px;
+        VerticalLayout {
+            spacing: 4px;
+            vertical-stretch: 0;
+            Text {
+                text: "新建热键";
+                color: Theme.fg;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            Muted {
+                text: root.where;
+            }
+        }
+        VerticalLayout {
+            spacing: 6px;
+            vertical-stretch: 0;
+            Text {
+                text: "名字（按钮上显示）";
+                color: Theme.mut;
+                font-size: 12.5px;
+            }
+            Rectangle {
+                height: 36px;
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: name-input.has-focus ? Theme.ink : Theme.line2;
+                background: Theme.win;
+                animate border-color { duration: 150ms; }
+                if name-input.text == "": Text {
+                    x: 11px;
+                    width: parent.width - 22px;
+                    height: parent.height;
+                    text: root.combo != "" ? "不填就叫「" + root.combo + "」" : "例如 保存、关窗口";
+                    color: Theme.mut;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                name-input := TextInput {
+                    x: 11px;
+                    width: parent.width - 22px;
+                    height: parent.height;
+                    color: Theme.fg;
+                    font-size: 13.5px;
+                    vertical-alignment: center;
+                    single-line: true;
+                    selection-background-color: Theme.lime;
+                    selection-foreground-color: Theme.lime-fg;
+                    init => {
+                        self.focus();
+                    }
+                    accepted => {
+                        if (root.combo != "" && root.issue == "") {
+                            root.save(self.text, root.combo, root.confirm, false);
+                        }
+                    }
+                }
+            }
+        }
+        VerticalLayout {
+            spacing: 6px;
+            vertical-stretch: 0;
+            Text {
+                text: "按键";
+                color: Theme.mut;
+                font-size: 12.5px;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                if !root.recording: Field {
+                    horizontal-stretch: 1;
+                    placeholder: "例如 Ctrl+S、Alt+Tab、Win+D（系统组合键可以直接填）";
+                    text <=> root.combo;
+                }
+                if !root.recording: VerticalLayout {
+                    alignment: center;
+                    GhostButton {
+                        small: true;
+                        text: "录制";
+                        has-icon: true;
+                        icon: @image-url("../icons/record.svg");
+                        clicked => {
+                            root.start-recording();
+                        }
+                    }
+                }
+                // 录的时候：按下按键或组合键就填进去，Esc 取消，点到别处也取消（和映射页一样）
+                if root.recording: Rectangle {
+                    horizontal-stretch: 1;
+                    height: 34px;
+                    border-radius: 9px;
+                    border-width: 1.5px;
+                    border-color: Theme.ink;
+                    background: Theme.soft;
+                    Text {
+                        x: 11px;
+                        width: parent.width - 22px;
+                        height: parent.height;
+                        text: Recorder.hint == "" ? "按下要录的键或组合键…（Esc 取消）" : Recorder.hint + " + …";
+                        color: Recorder.hint == "" ? Theme.mut : Theme.fg;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    FocusScope {
+                        init => {
+                            self.focus();
+                        }
+                        key-pressed(event) => {
+                            if (root.record-key(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta, true) != 0) {
+                                root.recorded();
+                            }
+                            accept
+                        }
+                        key-released(event) => {
+                            if (root.record-key(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta, false) != 0) {
+                                root.recorded();
+                            }
+                            accept
+                        }
+                        changed has-focus => {
+                            if (!self.has-focus && root.recording) {
+                                root.stop-recording();
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: "或者从列表选主键";
+                    color: Theme.mut;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+                KeyPicker {
+                    width: 230px;
+                    model: Lists.key-options;
+                    shown: root.main-key(root.combo);
+                    placeholder: "选一个键（Ctrl、Alt 这些留着）";
+                    quiet: true;
+                    selected(k) => {
+                        root.combo = root.pick-key(root.combo, k);
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+            if root.issue != "": Muted {
+                text: root.issue;
+                color: Theme.red;
+            }
+        }
+        TickBox {
+            text: "按之前先确认";
+            note: "手机上点了先问一句，防误点（比如 Alt+F4）";
+            checked: root.confirm;
+            toggled(on) => {
+                root.confirm = on;
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            // 双击、长按、多步：先建好，到映射页接着配（没填按键也能去，单击先空着）
+            GhostButton {
+                text: "去映射页细调";
+                has-icon: true;
+                icon-after: true;
+                icon: @image-url("../icons/arrow.svg");
+                enabled: root.issue == "";
+                clicked => {
+                    root.stop-recording();
+                    root.save(name-input.text, root.combo, root.confirm, true);
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            GhostButton {
+                text: "取消";
+                clicked => {
+                    root.stop-recording();
+                    root.cancel();
+                }
+            }
+            PrimaryButton {
+                text: "新建";
+                enabled: root.combo != "" && root.issue == "";
+                clicked => {
+                    root.stop-recording();
+                    root.save(name-input.text, root.combo, root.confirm, false);
+                }
+            }
+        }
+    }
+}
+
+// 远程工作台按钮库里的「＋ 新建常用文本」：名字、要打的字（可以多行）、打完按不按回车。
+// 建成正式版的常用文本按键（粘贴；打完按回车是粘贴、等 30 毫秒、按回车），放到点开按钮库的那一格
+component WbTextDialog inherits DialogCard {
+    in property <string> where;
+    // 名字、文字、打完按不按回车
+    callback save(string, string, bool);
+    callback cancel();
+    property <bool> enter: false;
+    card-width: 540px;
+    card-height: 470px;
+    // 点遮罩不关（会丢掉填的字），Esc 关
+    dismissable: false;
+    focus-self: false;
+    dismiss => {
+        root.cancel();
+    }
+    VerticalLayout {
+        padding: 22px;
+        spacing: 14px;
+        VerticalLayout {
+            spacing: 4px;
+            vertical-stretch: 0;
+            Text {
+                text: "新建常用文本";
+                color: Theme.fg;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            Muted {
+                text: root.where;
+            }
+        }
+        VerticalLayout {
+            spacing: 6px;
+            vertical-stretch: 0;
+            Text {
+                text: "名字（按钮上显示，短一点）";
+                color: Theme.mut;
+                font-size: 12.5px;
+            }
+            Rectangle {
+                height: 36px;
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: label-input.has-focus ? Theme.ink : Theme.line2;
+                background: Theme.win;
+                animate border-color { duration: 150ms; }
+                if label-input.text == "": Text {
+                    x: 11px;
+                    width: parent.width - 22px;
+                    height: parent.height;
+                    text: "例如 收到";
+                    color: Theme.mut;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+                label-input := TextInput {
+                    x: 11px;
+                    width: parent.width - 22px;
+                    height: parent.height;
+                    color: Theme.fg;
+                    font-size: 13.5px;
+                    vertical-alignment: center;
+                    single-line: true;
+                    selection-background-color: Theme.lime;
+                    selection-foreground-color: Theme.lime-fg;
+                    init => {
+                        self.focus();
+                    }
+                    // 回车：去填文字
+                    accepted => {
+                        text-input.focus();
+                    }
+                }
+            }
+        }
+        VerticalLayout {
+            spacing: 6px;
+            vertical-stretch: 0;
+            Text {
+                text: "要打的字（可以多行，最多 2000 字）";
+                color: Theme.mut;
+                font-size: 12.5px;
+            }
+            Rectangle {
+                height: 132px;
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: text-input.has-focus ? Theme.ink : Theme.line2;
+                background: Theme.win;
+                clip: true;
+                animate border-color { duration: 150ms; }
+                if text-input.text == "": Text {
+                    x: 11px;
+                    y: 9px;
+                    text: "例如 收到，我马上看一下。";
+                    color: Theme.mut;
+                    font-size: 13px;
+                }
+                text-flick := Flickable {
+                    x: 11px;
+                    y: 9px;
+                    width: parent.width - 22px;
+                    height: parent.height - 18px;
+                    // 鼠标拖是选字，不是滚动
+                    mouse-drag-pan-enabled: false;
+                    content-height: Math.max(self.height, text-input.preferred-height);
+                    text-input := TextInput {
+                        width: text-flick.width;
+                        height: Math.max(text-flick.height, self.preferred-height);
+                        color: Theme.fg;
+                        font-size: 13px;
+                        single-line: false;
+                        wrap: word-wrap;
+                        selection-background-color: Theme.lime;
+                        selection-foreground-color: Theme.lime-fg;
+                        // 光标跑到看不见的地方（打到下面、按方向键）：跟着滚过去
+                        cursor-position-changed(pos) => {
+                            if (pos.y + text-flick.content-y < 0) {
+                                text-flick.content-y = -pos.y;
+                            } else if (pos.y + text-flick.content-y + 20px > text-flick.height) {
+                                text-flick.content-y = text-flick.height - pos.y - 20px;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        TickBox {
+            text: "打完按回车（直接发出去）";
+            note: "粘贴完等一下再按回车";
+            checked: root.enter;
+            toggled(on) => {
+                root.enter = on;
+            }
+        }
+        Muted {
+            text: "存在电脑上，「映射」里也能改。别存密码。";
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            alignment: end;
+            GhostButton {
+                text: "取消";
+                clicked => {
+                    root.cancel();
+                }
+            }
+            PrimaryButton {
+                text: "新建";
+                enabled: label-input.text != "" && text-input.text != "";
+                clicked => {
+                    root.save(label-input.text, text-input.text, root.enter);
+                }
+            }
+        }
+    }
+}
+
 // 已保存的动作序列：把当前按法存起来，或者插入 / 替换到当前按法，可以改名、删除
 component SequencesDialog inherits DialogCard {
     in property <[SavedItem]> items;
@@ -4064,7 +5334,7 @@ component ActionParams inherits HorizontalLayout {
         alignment: center;
         horizontal-stretch: 1;
         Field {
-            placeholder: "用 + 连接，例如 Ctrl+Shift+P";
+            placeholder: "例如 Alt+Tab、Ctrl+Shift+P（系统组合键可直接填写）";
             text: root.item.text;
             edited(t) => {
                 root.text-changed(t);
@@ -10774,6 +12044,31 @@ export component AppWindow inherits Window {
     callback sel-hold-changed(int);
     callback hold-blocked();
     callback edit-mapping();
+    // 布局页的「远程工作台」标签（见 LayoutPage、ui/src/workbench.rs）
+    in property <bool> wb-open;
+    in property <bool> wb-ready;
+    in property <[WbChip]> wb-ball;
+    in property <[WbChip]> wb-quick;
+    in property <[WbChip]> wb-voice;
+    in property <[WbChip]> wb-keymouse;
+    in property <[WbChip]> wb-rail;
+    callback open-workbench();
+    callback wb-create();
+    callback wb-menu(int, int) -> [WbItem];
+    callback wb-library(int, int) -> [WbItem];
+    callback wb-act(int, int, string, string);
+    // 远程工作台按钮库里「＋ 新建热键」「＋ 新建常用文本」的对话框：建好放到哪（wb-new-where），
+    // 新建热键的按键（录到的由 Rust 填进来）
+    in property <bool> wb-hotkey-open;
+    in property <bool> wb-text-open;
+    in property <string> wb-new-where;
+    in-out property <string> wb-hotkey-combo;
+    callback wb-hotkey-save(string, string, bool, bool);
+    callback wb-text-save(string, string, bool);
+    callback wb-new-cancel();
+    pure callback wb-combo-problem(string) -> string;
+    pure callback wb-combo-main(string) -> string;
+    pure callback wb-combo-pick(string, int) -> string;
     // 改网格
     in property <bool> grid-open;
     pure callback grid-problem(int, int) -> string;
@@ -10989,7 +12284,7 @@ export component AppWindow inherits Window {
             return x >= root.width - root.window-buttons-width + 34px && x < root.width - root.window-buttons-width + 68px ? 2 : 0;
         }
         // 对话框开着时卡片最高到离窗口顶 30px；顶栏的弹出菜单从 56px 开始
-        if (y >= ((root.confirm-open || root.name-open || root.import-open || root.sequences-open || root.grid-open || root.tutorial-open || root.update-open) ? 30px : 54px)) {
+        if (y >= ((root.confirm-open || root.name-open || root.import-open || root.sequences-open || root.grid-open || root.tutorial-open || root.update-open || root.wb-hotkey-open || root.wb-text-open) ? 30px : 54px)) {
             return 0;
         }
         if (root.inside(x, y, map-pill.absolute-position.x, map-pill.absolute-position.y, map-pill.width, map-pill.height)
@@ -11019,7 +12314,12 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         capture-key-pressed(event) => {
-            if (root.confirm-open || root.name-open || root.import-open || root.sequences-open || root.grid-open || root.tutorial-open || root.update-open || Recorder.active) {
+            // 远程工作台里正拖着按钮：Esc 不放了
+            if (WbDrag.active && event.text == Key.Escape) {
+                WbDrag.active = false;
+                return accept;
+            }
+            if (root.confirm-open || root.name-open || root.import-open || root.sequences-open || root.grid-open || root.tutorial-open || root.update-open || root.wb-hotkey-open || root.wb-text-open || Recorder.active) {
                 return reject;
             }
             if (event.modifiers.control && !event.modifiers.alt) {
@@ -11607,6 +12907,28 @@ export component AppWindow inherits Window {
                                 edit-mapping => {
                                     root.edit-mapping();
                                 }
+                                wb-open: root.wb-open;
+                                wb-ready: root.wb-ready;
+                                wb-ball: root.wb-ball;
+                                wb-quick: root.wb-quick;
+                                wb-voice: root.wb-voice;
+                                wb-keymouse: root.wb-keymouse;
+                                wb-rail: root.wb-rail;
+                                open-workbench => {
+                                    root.open-workbench();
+                                }
+                                wb-create => {
+                                    root.wb-create();
+                                }
+                                wb-menu(p, i) => {
+                                    return root.wb-menu(p, i);
+                                }
+                                wb-library(p, i) => {
+                                    return root.wb-library(p, i);
+                                }
+                                wb-act(p, i, t, a) => {
+                                    root.wb-act(p, i, t, a);
+                                }
                             }
                             if root.nav == 2: MappingPage {
                                 list: root.map-list;
@@ -11819,9 +13141,9 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                // 提示：底部的黑色小条，淡入淡出；可以带一个按钮（撤销、打开所在文件夹）。布局页时避开手机画面
+                // 提示：底部的黑色小条，淡入淡出；可以带一个按钮（撤销、打开所在文件夹）。布局页时避开手机画面（远程工作台没有手机画面）
                 Rectangle {
-                    property <length> area-left: root.nav == 1 ? root.layout-left : 0px;
+                    property <length> area-left: root.nav == 1 && !root.wb-open ? root.layout-left : 0px;
                     x: self.area-left + (parent.width - self.area-left - self.width) / 2;
                     y: parent.height - 64px + (root.toast != "" ? 0px : 8px);
                     width: Math.min(parent.width - self.area-left - 24px, toast-text.preferred-width + (root.toast-action != "" ? action-text.preferred-width + 34px : 0px) + 38px);
@@ -11877,7 +13199,7 @@ export component AppWindow inherits Window {
                     x: right-tools.x + right-tools.width - 230px;
                     y: 56px;
                     width: 200px;
-                    height: 3 * 36px + 10px;
+                    height: 4 * 36px + 10px;
                     close-policy: PopupClosePolicy.close-on-click-outside;
                     Rectangle {
                         property <bool> shown: false;
@@ -11895,6 +13217,7 @@ export component AppWindow inherits Window {
                             { kind: 1, k: "touchpad", title: "添加触控板" },
                             { kind: 3, k: "voiceButton", title: "添加语音按钮" },
                             { kind: 2, k: "voice", title: "添加语音输入框" },
+                            { kind: 4, k: "screen", title: "添加电脑屏幕" },
                         ]: Rectangle {
                             x: 5px;
                             y: 5px + i * 36px;
@@ -12001,6 +13324,26 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    // 远程工作台里拖着按钮时跟着鼠标走的小条：拖的是谁；放不了就写原因（红的）
+    if WbDrag.active: drag-tag := Rectangle {
+        property <bool> bad: WbDrag.problem != "" && WbDrag.problem != "=";
+        x: Math.max(0px, Math.min(WbDrag.x + 14px, root.width - self.width - 8px));
+        y: Math.max(0px, Math.min(WbDrag.y + 16px, root.height - self.height - 8px));
+        width: drag-text.preferred-width + 24px;
+        height: 30px;
+        border-radius: 10px;
+        background: drag-tag.bad ? Theme.red : Theme.ink;
+        drag-text := Text {
+            x: 12px;
+            height: parent.height;
+            text: drag-tag.bad ? WbDrag.problem : WbDrag.label;
+            color: drag-tag.bad ? #ffffff : Theme.ink-fg;
+            font-size: 12.5px;
+            font-weight: 600;
+            vertical-alignment: center;
         }
     }
 
@@ -12129,6 +13472,38 @@ export component AppWindow inherits Window {
         }
         open-page => {
             root.update-page();
+        }
+    }
+    if root.wb-hotkey-open: WbHotkeyDialog {
+        where: root.wb-new-where;
+        combo <=> root.wb-hotkey-combo;
+        save(n, c, f, m) => {
+            root.wb-hotkey-save(n, c, f, m);
+        }
+        cancel => {
+            root.wb-new-cancel();
+        }
+        // 下标 -1：录到的键填进这个对话框（不是映射页的哪一步）
+        record-key(t, c, a, sh, m, p) => {
+            return root.record-key(-1, t, c, a, sh, m, p);
+        }
+        problem(c) => {
+            return root.wb-combo-problem(c);
+        }
+        main-key(c) => {
+            return root.wb-combo-main(c);
+        }
+        pick-key(c, k) => {
+            return root.wb-combo-pick(c, k);
+        }
+    }
+    if root.wb-text-open: WbTextDialog {
+        where: root.wb-new-where;
+        save(n, t, e) => {
+            root.wb-text-save(n, t, e);
+        }
+        cancel => {
+            root.wb-new-cancel();
         }
     }
     if root.lan-open: LanDialog {

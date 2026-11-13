@@ -2,7 +2,8 @@
 //! 加密和认证在 suanniao-lan 里（TLS + 手机钉住证书指纹 + 一次性配对码 / 长期令牌），这里管：
 //! - 什么时候开始听：绑定过手机，或者主界面打开了二维码（没用过局域网的电脑不开端口，也不会弹防火墙提示）
 //! - 主界面的指令（lan-command.json）：要配对码、作废配对码、解除绑定
-//! - 这台电脑的地址（有线、无线网卡的 IPv4），变了告诉连着的手机
+//! - 这台电脑的地址（有线、无线网卡的 IPv4），变了（系统一说网络变了就看）马上告诉连着的手机，蓝牙、局域网都发；
+//!   电脑没网时也说一声（地址列表是空的）
 //! - 状态写进 status.json 的 lan，主界面据此画二维码、列已绑定的手机
 //!
 //! 认证过的连接交给 link::run_lan，和蓝牙连接跑一样的会话。
@@ -31,6 +32,8 @@ struct Lan {
     server: Server,
     listening: AtomicBool,
     port: Mutex<u16>,
+    screen_port: Mutex<u16>,
+    screen_h264_port: Mutex<u16>,
     addrs: Mutex<Vec<String>>,
     /// 现在的配对码和过期时刻（Unix 秒）
     pair: Mutex<Option<(String, u64)>>,
@@ -39,6 +42,9 @@ struct Lan {
 }
 
 static LAN: OnceLock<Lan> = OnceLock::new();
+
+/// 系统说 IPv4 地址或者网卡变了（见 watch_net_changes）：watch 过一秒就重新读地址，不用等 10 秒一次的检查
+static NET_CHANGED: AtomicBool = AtomicBool::new(false);
 
 fn dir() -> PathBuf {
     config::lan_dir()
@@ -58,6 +64,8 @@ pub fn start() {
                 server,
                 listening: AtomicBool::new(false),
                 port: Mutex::new(0),
+                screen_port: Mutex::new(0),
+                screen_h264_port: Mutex::new(0),
                 addrs: Mutex::new(local_addrs()),
                 pair: Mutex::new(None),
                 just_paired: Mutex::new((String::new(), 0, "")),
@@ -77,8 +85,42 @@ pub fn start() {
             listen(lan);
         }
         refresh_status();
+        watch_net_changes();
         watch(lan);
     });
+}
+
+/// 让系统在 IPv4 地址、网卡状态变了时说一声（只做个记号，读地址、告诉手机都在 watch 里）。
+/// 注册不上就只靠 watch 每 10 秒看一次
+fn watch_net_changes() {
+    if let Err(e) = notify_net_changes(false) {
+        log!("⚠ 网络变化的通知没注册上（{e}），只能每 10 秒看一次地址");
+    }
+}
+
+/// 向系统注册地址、网卡变化的通知（一直通知到后台退出，句柄不用关）；没注册上返回两个错误码。
+/// initial：注册完马上通知一次（测试用）
+fn notify_net_changes(initial: bool) -> Result<(), String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        NotifyIpInterfaceChange, NotifyUnicastIpAddressChange, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET;
+
+    unsafe extern "system" fn address_changed(_: *const std::ffi::c_void, _: *const MIB_UNICASTIPADDRESS_ROW, _: MIB_NOTIFICATION_TYPE) {
+        NET_CHANGED.store(true, Ordering::SeqCst);
+    }
+    unsafe extern "system" fn interface_changed(_: *const std::ffi::c_void, _: *const MIB_IPINTERFACE_ROW, _: MIB_NOTIFICATION_TYPE) {
+        NET_CHANGED.store(true, Ordering::SeqCst);
+    }
+    let (mut address, mut interface) = (HANDLE::default(), HANDLE::default());
+    let a = unsafe { NotifyUnicastIpAddressChange(AF_INET, Some(address_changed), None, initial, &mut address) };
+    let b = unsafe { NotifyIpInterfaceChange(AF_INET, Some(interface_changed), None, initial, &mut interface) };
+    if a.is_ok() && b.is_ok() {
+        Ok(())
+    } else {
+        Err(format!("{} / {}", a.0, b.0))
+    }
 }
 
 /// 开始听（已经在听就什么都不做）
@@ -103,6 +145,69 @@ fn listen(lan: &'static Lan) {
         let _ = std::fs::write(&port_file, port.to_string());
     }
     *lan.port.lock().unwrap() = port;
+    // 视频使用同一 TLS 身份和配对凭据，但不占用原有控制消息队列。
+    // 系统分配独立端口，无法启用时原有控制功能照常可用。
+    if let Ok(video) = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        if let Ok(addr) = video.local_addr() {
+            *lan.screen_port.lock().unwrap() = addr.port();
+            std::thread::spawn(move || {
+                use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+                static AUTH_PENDING: AtomicUsize = AtomicUsize::new(0);
+                for incoming in video.incoming() {
+                    let Ok(tcp) = incoming else { continue };
+                    if AUTH_PENDING.fetch_add(1, AtomicOrdering::AcqRel) >= 4 {
+                        AUTH_PENDING.fetch_sub(1, AtomicOrdering::AcqRel);
+                        drop(tcp);
+                        continue;
+                    }
+                    std::thread::spawn(move || {
+                        if let Ok((conn, phone)) = lan.server.accept_existing(tcp, &lan.pairings) {
+                            if !phone.newly_paired { crate::screen::serve(conn, &phone.id); }
+                            else { conn.shutdown(); }
+                        }
+                        AUTH_PENDING.fetch_sub(1, AtomicOrdering::AcqRel);
+                    });
+                }
+            });
+        }
+    }
+    // H.264 has its own authenticated port. Old Android only knows screenPort/JPEG.
+    // The second port is optional: failure must never affect LAN/BT control or JPEG.
+    if let Ok(video) = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        if let Ok(addr) = video.local_addr() {
+            *lan.screen_h264_port.lock().unwrap() = addr.port();
+            std::thread::spawn(move || {
+                use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+                static AUTH_PENDING: AtomicUsize = AtomicUsize::new(0);
+                for incoming in video.incoming() {
+                    let Ok(tcp) = incoming else { continue };
+                    if AUTH_PENDING.fetch_add(1, AtomicOrdering::AcqRel) >= 4 {
+                        AUTH_PENDING.fetch_sub(1, AtomicOrdering::AcqRel);
+                        drop(tcp);
+                        continue;
+                    }
+                    std::thread::spawn(move || {
+                        match lan.server.accept_existing(tcp, &lan.pairings) {
+                            Ok((conn, phone)) => {
+                                if !phone.newly_paired {
+                                    log!("📺 H264: TLS/配对认证通过，启动视频流");
+                                    match crate::screen_h264::stream_h264(&conn, &phone.id) {
+                                        Ok(()) => log!("📺 H264: 正常退出"),
+                                        Err(e) => log!("📺 H264: 视频流退出（错误类别 {:?}）", e.kind()),
+                                    }
+                                }
+                                conn.shutdown();
+                            }
+                            Err(e) => log!("📺 H264: TLS/配对认证未通过（{}）", e.reason()),
+                        }
+                        AUTH_PENDING.fetch_sub(1, AtomicOrdering::AcqRel);
+                    });
+                }
+            });
+            // 能开远程画面了：先在后台试出编码器，手机第一次连 H.264 时不用再等试编码（审查 #10）
+            crate::screen_h264::probe_in_background();
+        }
+    }
     log!("✅ 局域网连接已就绪：端口 {port}，地址 {}", lan.addrs.lock().unwrap().join("、"));
     state::update_status(|s| s.lan.error.clear());
     std::thread::spawn(move || {
@@ -133,7 +238,7 @@ fn listen(lan: &'static Lan) {
     });
 }
 
-/// 每半秒看一次主界面的指令，每 10 秒看一次网卡地址
+/// 每半秒看一次主界面的指令；网卡地址每 10 秒看一次，系统说网络变了就过一秒再看
 fn watch(lan: &'static Lan) {
     let mut handled = config::read_lan_command().map(|c| c.seq).unwrap_or(0);
     // 上次退出时二维码还开着：主界面重开二维码会再写指令，这里不当真；
@@ -143,6 +248,8 @@ fn watch(lan: &'static Lan) {
         refresh_status();
     }
     let mut tick = 0u64;
+    // 系统说网络变了以后，到第几下再读地址：等一秒让地址、网关都配好，一阵变化只读一次
+    let mut recheck: Option<u64> = None;
     loop {
         std::thread::sleep(Duration::from_millis(500));
         tick += 1;
@@ -162,14 +269,23 @@ fn watch(lan: &'static Lan) {
         if tick % 10 == 0 {
             crate::btpair::sweep();
         }
-        if tick % 20 == 0 {
+        if NET_CHANGED.swap(false, Ordering::SeqCst) && recheck.is_none() {
+            recheck = Some(tick + 2);
+        }
+        if tick % 20 == 0 || recheck.is_some_and(|at| tick >= at) {
+            recheck = None;
             let fresh = local_addrs();
             let changed = *lan.addrs.lock().unwrap() != fresh;
             if changed {
-                log!("🌐 这台电脑的局域网地址变了：{}", if fresh.is_empty() { "没有可用的网络".to_string() } else { fresh.join("、") });
+                let offline = fresh.is_empty();
+                log!("🌐 这台电脑的局域网地址变了：{}", if offline { "没有可用的网络".to_string() } else { fresh.join("、") });
                 *lan.addrs.lock().unwrap() = fresh;
                 refresh_status();
-                send_info();
+                // 马上告诉手机（换了地址、没网了、网回来了都发）：手机收到新地址就去连，不用等它自己重试
+                let sent = send_info();
+                if !sent.is_empty() {
+                    log!("📨 {}（{}）", if offline { "已告诉手机电脑没网了" } else { "已把新地址发给手机" }, sent.join("、"));
+                }
             }
         }
     }
@@ -271,14 +387,14 @@ pub fn pc_id() -> String {
     LAN.get().map(|l| l.identity.pc_id().to_string()).unwrap_or_default()
 }
 
-/// 告诉连着的手机现在的地址（蓝牙连着也发：手机靠它更新记着的局域网地址，IP 变了也不用重新扫码）
-pub fn send_info() {
-    if let Some(info) = info() {
-        link::send_to_phone(&info);
-    }
+/// 告诉连着的手机现在的地址：每条连着的连接都发（蓝牙连着也发：手机靠它更新记着的局域网地址，IP 变了也不用重新扫码；
+/// 地址变了时局域网那条多半已经断了，靠蓝牙送到）。返回发到了哪几种连接
+pub fn send_info() -> Vec<&'static str> {
+    info().map(|info| link::send_to_every_link(&info)).unwrap_or_default()
 }
 
-/// 发给手机的地址消息；没在监听是 None
+/// 发给手机的地址消息；没在监听是 None。电脑没网时 addrs 是空的：新版手机据此知道是电脑这边断了，
+/// 旧版手机收到空的地址列表什么都不做（不会把记着的地址清掉）
 pub fn info() -> Option<serde_json::Value> {
     let lan = LAN.get()?;
     if !lan.listening.load(Ordering::SeqCst) {
@@ -289,6 +405,8 @@ pub fn info() -> Option<serde_json::Value> {
         "pc": lan.identity.pc_id(),
         "addrs": *lan.addrs.lock().unwrap(),
         "port": *lan.port.lock().unwrap(),
+        "screenPort": *lan.screen_port.lock().unwrap(),
+        "screenH264Port": *lan.screen_h264_port.lock().unwrap(),
         "fp": lan.identity.fingerprint(),
     }))
 }
@@ -362,4 +480,21 @@ pub fn local_addrs() -> Vec<String> {
     }
     out.truncate(4);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 注册得上，系统的通知也真能叫到这边（注册时要它马上通知一次）
+    #[test]
+    fn net_change_notifications_arrive() {
+        NET_CHANGED.store(false, Ordering::SeqCst);
+        assert_eq!(notify_net_changes(true), Ok(()));
+        let start = std::time::Instant::now();
+        while !NET_CHANGED.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(NET_CHANGED.load(Ordering::SeqCst));
+    }
 }

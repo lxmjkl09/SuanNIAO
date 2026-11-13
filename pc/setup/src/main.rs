@@ -1,7 +1,8 @@
 //! 蒜鸟电脑端安装包的启动程序。发版时 suanniao-pack 在它后面接上 SuanNIAO.exe 和 SuanNIAO-core.exe，
 //! 就是 SuanNIAO-PC-版本-Setup.exe。
 //!
-//! 双击后把两个 exe 解到临时文件夹，运行里面的 `SuanNIAO.exe --setup`：安装界面就是主界面程序的安装模式，
+//! 打包时给了 SUANNIAO_PACK_FFMPEG 的，包里还有 ffmpeg.exe（远程画面编码用，见 pack.rs）。
+//! 双击后把包里的文件都解到临时文件夹，运行里面的 `SuanNIAO.exe --setup`：安装界面就是主界面程序的安装模式，
 //! 和蒜鸟长得一样（见 ui/src/setup.rs）。等它结束，删掉临时文件夹。
 //! 命令行参数原样传过去（--update、--dir、--silent、--no-desktop）。
 

@@ -202,7 +202,8 @@ impl Import {
         if modules.is_empty() {
             return Err("一个键都没勾".into());
         }
-        Ok(Page { id: config.new_id("remote"), name, modules })
+        // 这里只有只读的配置：先用 next_id 定下页面 id，真加进配置时（add_page_as_profile）再记下编号
+        Ok(Page { id: config.next_id("remote"), name, modules })
     }
 }
 

@@ -7,6 +7,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
@@ -21,6 +23,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.provider.Settings
 import android.speech.RecognitionService
 import android.text.TextUtils
@@ -85,6 +88,8 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
 
     private lateinit var root: FrameLayout
     private lateinit var content: LinearLayout
+    /** 提示卡片、对话框那一层：全屏工作台加进来以后要再提到最上面，不然提示被画面盖住 */
+    private lateinit var overlayHost: FrameLayout
     private lateinit var overlays: Overlays
     private lateinit var setup: Setup
     /** 检查更新（Updater.kt） */
@@ -105,6 +110,20 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
     private lateinit var tabs: LinearLayout
     private lateinit var tabScroller: HorizontalScrollView
     private lateinit var grid: GridLayoutView
+    private val screenStream by lazy { ScreenStream(this) }
+    // Debounce SurfaceTexture detach/attach during grid → fullscreen transition.
+    // Closing the old H264 encoder takes a little time; subscribing immediately
+    // can overlap its one-stream guard and trigger H264 EOF/retry cycles.
+    private val delayedScreenStart = Runnable { updateScreenStream() }
+    /** 只在手机界面临时放大屏幕模块，退出时恢复网格里的原位置。 */
+    private var focusedScreen: ScreenView? = null
+    private var focusedScreenId = ""
+    private var focusedScreenCell: GridLayoutView.Cell? = null
+    private var focusedControls: ScreenFocusControls? = null
+    private var focusedVoice: VoiceButton? = null
+    private var deferredFocusConfig = false
+    private var focusLandscape = false
+    private var focusRotationMode = 0
     /** 顶栏下面的横幅：没连上电脑、按键已暂停等 */
     private lateinit var bannerBox: FrameLayout
     private lateinit var bannerDot: StatusDot
@@ -168,7 +187,9 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
     private var config: JSONObject = JSONObject(DEFAULT_CONFIG)
     private var configText = ""
     private var configPendingText = ""
+    /** 看的是看得见的页里的第几个（工作台专用页不算，见 LayoutPages），和那一页的 id（null = 旧版只记了下标） */
     private var pageIndex = 0
+    private var pageId: String? = null
     /** 触控板和语音换布局时尽量复用（换页时也留着），免得正在输入的字、正在说的话丢掉 */
     private val reusable = mutableMapOf<String, View>()
     /** 顶栏右边正在显示临时消息（按了什么键、提示）时，状态变化不要覆盖它 */
@@ -225,6 +246,7 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         pendingLayout = prefs.getString(KEY_PENDING_LAYOUT, null)?.let { runCatching { JSONObject(it) }.getOrNull() }
         pendingLayoutPc = prefs.getString(KEY_PENDING_LAYOUT_PC, null)
         pageIndex = prefs.getInt(KEY_PAGE, 0)
+        pageId = prefs.getString(KEY_PAGE_ID, null)
         applyConfig(force = true)
         Computers.listen(computersChanged)
         updatePcButton()
@@ -251,6 +273,7 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         main.postDelayed({ maybeOfferPending(force = false) }, 400)
         main.postDelayed({ offerBattery(force = false) }, 900)
         updater.onResume() // 可能刚从「安装未知应用」设置、系统安装界面回来
+        updateScreenStream()
         getSystemService(ClipboardManager::class.java)?.addPrimaryClipChangedListener(clipListener) // 在蒜鸟里复制的也同步
     }
 
@@ -270,6 +293,17 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
     }
 
     override fun onPause() {
+        focusedScreen?.cancelRemoteGesture()
+        focusedControls?.onPaused()
+        focusedVoice?.stopListening()
+        (0 until grid.childCount).map { grid.getChildAt(it) }
+            .filterIsInstance<ScreenView>().forEach { it.cancelRemoteGesture() }
+        main.removeCallbacks(delayedScreenStart)
+        // Orientation changes, permission dialogs and brief focus switches must
+        // not permanently tear down the full-screen controls. Stop only live
+        // media/input while backgrounded; onResume will reattach the stream.
+        main.removeCallbacks(delayedScreenStart)
+        screenStream.stop()
         resumed = false
         getSystemService(ClipboardManager::class.java)?.removePrimaryClipChangedListener(clipListener)
         updater.onPause()
@@ -277,10 +311,15 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
     }
 
     override fun onDestroy() {
+        main.removeCallbacks(delayedScreenStart)
+        screenStream.stop()
+        focusedControls?.release()
+        focusedControls = null
         Computers.unlisten(computersChanged)
         main.removeCallbacks(switchTimeout)
         btPair.cancel()
         reusable.values.forEach { (it as? VoiceButton)?.release() }
+        focusedVoice?.release()
         updater.detach()
         super.onDestroy()
     }
@@ -355,6 +394,7 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         releaseKeys()
         // 后台录不了音：正在说的话当作说完了；本地语音模型过一阵还没回来就从内存放掉
         reusable.values.forEach { (it as? VoiceButton)?.stopListening() }
+        focusedVoice?.stopListening()
         LocalAsr.releaseLater()
         link?.listener = null
         unbindService(connection)
@@ -501,7 +541,10 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         overridePendingTransition(R.anim.scan_enter, 0) // 整屏淡入，遮罩、四个角的进场动画扫码界面自己画
     }
 
-    /** 菜单里「发文件到电脑」：系统的选文件界面，能多选 */
+    /**
+     * 菜单里「发文件到电脑」、全屏工作台悬浮球里的「发图片」：系统的选文件界面，能多选。
+     * 选完回到 onActivityResult（全屏工作台还在：转屏不重建界面，服务的 link 也一直留着）
+     */
     private fun pickFiles() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
             .addCategory(Intent.CATEGORY_OPENABLE)
@@ -520,7 +563,9 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         val items = FileSender.open(this, uris)
         if (items.isEmpty()) return say("这些文件打不开，没法发")
         l.files.enqueue(items)
-        flash(if (items.size == 1) "正在发到电脑：${items[0].name}" else "正在发到电脑：${items.size} 个文件", 3000)
+        val text = if (items.size == 1) "正在发到电脑：${items[0].name}" else "正在发到电脑：${items.size} 个文件"
+        // 全屏工作台（悬浮球「发图片」）时顶栏看不见：用卡片说
+        if (focusedScreen != null) say(text) else flash(text, 3000)
     }
 
     private fun pickQrImage() {
@@ -871,10 +916,387 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    /**
+     * 视频仅在手机界面可见且已通过局域网控制连接时订阅。
+     * 没连上时「电脑屏幕」模块（网格里、全屏）看状态说话：电脑没网、正在重连、只有蓝牙（v3.3 U4）
+     */
+    private fun updateScreenStream() {
+        val screen = focusedScreen ?: (0 until grid.childCount).map { grid.getChildAt(it) }
+            .filterIsInstance<ScreenView>().firstOrNull()
+        if (!resumed || screen == null || !status.lan) {
+            screenStream.stop()
+            val binding = LanBinding.load(this)
+            screen?.showDisconnected(ScreenLinkHint.text(status.bt, status.lanPhase, status.pcOffline,
+                bound = binding != null, revoked = binding?.revoked == true))
+            return
+        }
+        if (!screen.hasDecoderSurface()) {
+            screenStream.stop()
+            return
+        }
+        val binding = LanBinding.load(this)
+        if (binding == null) {
+            screenStream.stop()
+            screen.showDisconnected("请扫码绑定局域网")
+            return
+        }
+        screenStream.start(binding, screen)
+    }
+
+    private fun toggleScreenFocus(screen: ScreenView) {
+        if (focusedScreen === screen) {
+            closeScreenFocus()
+            return
+        }
+        if (editor != null) return // 调整布局时不能移动正在编辑的模块
+        closeScreenFocus()
+        val parent = screen.parent as? ViewGroup ?: return
+        val cell = grid.cellOf(screen)
+        val id = grid.idOf(screen)
+        parent.removeView(screen)
+        focusedScreen = screen
+        focusedScreenId = id
+        focusedScreenCell = cell
+        screen.setExpanded(true)
+        root.addView(screen, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        // 操作侧栏占独立宽度，缩小画面真实视口，而不是覆盖或给它补黑边。
+
+        // 语音仍使用原版 VoiceButton 和 sendText/typeLive，保持离线语音引擎、发送逻辑一致。
+        val voice = newVoiceButton("语音").also {
+            it.localModel = chosenModel()
+            it.liveTyping = prefs.getBoolean(KEY_LIVE_TYPING, true)
+            it.offline = !connected
+        }
+        focusedVoice = voice
+        val controls = ScreenFocusControls(this, workbenchHost(screen), voice)
+        focusedControls = controls
+        screen.onQuickActionsRequested = { focusedControls?.openKeys() }
+        screen.onAppSwitchRequested = { focusedControls?.switchApp() }
+        screen.onSelectionHint = { say(it) }
+        screen.onSelectionStateChanged = { controls.onSelectionStateChanged(it) }
+        screen.onDesktopSizeChanged = { _, _ -> fitFocusedScreen() }
+        controls.updateConfig(config)
+        root.addView(controls, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        // 提示卡片（「已发：收到」「正在发到电脑」等）和对话框要盖在画面、工作台上面；
+        // 卡片放到底部中间而且不接手指，不挡悬浮球、切换应用面板、电脑画面（审查 #2）
+        overlayHost.bringToFront()
+        overlays.noticePassThrough = true
+        root.addOnLayoutChangeListener(focusLayoutListener)
+        fitFocusedScreen()
+        Log.i("SuanNIAO-workbench", "fullscreen attached; rootChildren=${root.childCount}")
+        // 远程操作真正占满系统栏空间；原版首页返回时恢复系统栏。
+        updateRemoteSystemBars(true)
+        focusLandscape = true
+        focusRotationMode = 0
+        // Follow gravity sensor in workbench, with explicit manual lock options.
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+    }
+
+    /** 全屏工作台要的「发给电脑、改画面」：沿用原来各个回调里的检查和提示 */
+    private fun workbenchHost(screen: ScreenView) = object : ScreenFocusControls.Host {
+        private fun ready(lan: Boolean = false): Boolean {
+            if (!connected) { say("请先连接电脑"); return false }
+            if (mappingPaused) { say("电脑端暂停了按键映射"); return false }
+            if (lan && !status.lan) { say("这个操作需要局域网连接"); return false }
+            return true
+        }
+
+        override fun sendKey(key: String, modifiers: List<String>): Boolean {
+            if (!ready()) return false
+            val sent = link?.send(JSONObject().put("t", "key").put("k", key).put("m", JSONArray(modifiers))) == true
+            if (!sent) say("按键没发出去")
+            return sent
+        }
+
+        override fun sendButton(id: String, trigger: String): Boolean {
+            if (!ready()) return false
+            val sent = link?.send(JSONObject().put("t", "button").put("id", id).put("trigger", trigger)) == true
+            if (sent) Ui.buzz(root, Ui.Buzz.KEY) else say("快捷键没发出去")
+            return sent
+        }
+
+        override fun sendText(text: String): Boolean {
+            if (!ready(lan = true)) return false
+            val payload = RemoteTypedTextMessage.payload(text)
+            val sent = payload != null && link?.send(payload) == true
+            if (sent) {
+                Ui.buzz(root, Ui.Buzz.CONFIRM)
+                say("已将文字输入电脑光标处（未自动回车）")
+            } else say("文字没发出去，输入的内容还留着")
+            return sent
+        }
+
+        override fun sendTaskSwitch(action: String): Boolean =
+            ready(lan = true) && link?.send(JSONObject().put("t", "taskSwitch").put("a", action)) == true
+
+        // 松开修饰键不能被「暂停」拦住，否则电脑上的 Ctrl 会一直按着；电脑端断线时自己全部松开
+        override fun sendModifier(key: String, down: Boolean): Boolean =
+            connected && status.lan && link?.send(JSONObject().put("t", "mod").put("k", key).put("down", down)) == true
+
+        override fun sendToPc(message: JSONObject): Boolean = ready(lan = true) && link?.send(message) == true
+        override fun armSelection() = screen.armNextSelectionDrag()
+        override fun cancelSelection() = screen.cancelSelectionDrag()
+        override fun setInputMode(mode: ScreenView.InputMode) = screen.setInputMode(mode)
+
+        override fun toggleFill() {
+            screen.setDisplayMode(if (screen.getDisplayMode() == ScreenCoordinates.DisplayMode.COVER)
+                ScreenCoordinates.DisplayMode.CONTAIN else ScreenCoordinates.DisplayMode.COVER)
+            fitFocusedScreen()
+        }
+
+        override fun isFill(): Boolean = screen.getDisplayMode() == ScreenCoordinates.DisplayMode.COVER
+        override fun resetZoom() = screen.resetZoom()
+        override fun toggleRotationLock() = toggleScreenOrientation()
+        override fun isRotationLocked(): Boolean = focusRotationMode == 1
+
+        // 键鼠条的鼠标键：精密鼠标点在箭头上；自然触控、只看画面没有箭头，就点在电脑鼠标现在的位置
+        // （上一次手指点的地方）。以前只在精密模式下有用，自然触控时点了没反应。
+        private fun precise() = screen.getInputMode() == ScreenView.InputMode.PRECISE
+
+        private fun mouseReady(): Boolean {
+            if (status.lan) return true
+            say("鼠标操作需要局域网连接")
+            return false
+        }
+
+        override fun leftClick() {
+            if (!mouseReady()) return
+            if (precise()) screen.leftClickAtCursor()
+            else link?.send(JSONObject().put("t", "mouse").put("b", "left").put("a", "click"))
+        }
+
+        override fun rightClick() {
+            if (!mouseReady()) return
+            if (precise()) screen.rightClickAtCursor()
+            else link?.send(JSONObject().put("t", "mouse").put("b", "right").put("a", "click"))
+        }
+
+        override fun scroll(direction: Int) {
+            if (!mouseReady()) return
+            if (precise()) screen.scrollAtCursor(direction)
+            else link?.send(JSONObject().put("t", "scroll").put("x", 0).put("y", direction * 120))
+        }
+
+        // 只在精密模式下调（ScreenFocusControls.toggleHold 先切模式）。
+        // 局域网断了还按着：不能只把按钮改回「按住」，要让电脑真的松开——收起这次按住，抬起发不出去就改发「全部松开」（remotePointer）
+        override fun toggleHold(): Boolean {
+            if (mouseReady()) return screen.toggleMouseHold()
+            if (screen.isMouseHeld()) screen.cancelRemoteGesture()
+            return false
+        }
+
+        override fun setCursorAppearance(style: ScreenView.CursorStyle, size: Float) {
+            screen.cursorStyle = style
+            screen.cursorSize = size
+        }
+
+        override fun notice(text: String) = say(text)
+        override fun close() = closeScreenFocus()
+
+        // 跟 ⋯ 菜单「发文件到电脑」一样：没连上就不打开选文件
+        override fun pickFiles() {
+            if (!connected) return say("连上电脑后才能发图片")
+            this@MainActivity.pickFiles()
+        }
+
+        // 跟 ⋯ 菜单「语音识别」同一套：本地模型（标题、小字一样）+ 系统引擎 + 边说边打字
+        override fun voiceSettings(): ScreenFocusControls.VoiceSettings {
+            val models = LocalAsr.models(this@MainActivity)
+            val options = models.map { ScreenFocusControls.VoiceOption(it.name, modelTitle(it), modelSubtitle(it)) }
+                .ifEmpty { listOf(ScreenFocusControls.VoiceOption("", "本地识别", "没有语音模型：去网页下完整安装包")) } +
+                ScreenFocusControls.VoiceOption(ASR_SYSTEM, "系统引擎（联网，无标点）", "手机自带，一句一句出字")
+            return ScreenFocusControls.VoiceSettings(options, chosenModel()?.name ?: ASR_SYSTEM, prefs.getBoolean(KEY_LIVE_TYPING, true))
+        }
+
+        override fun setVoiceSettings(choice: String, liveTyping: Boolean) {
+            prefs.edit().putBoolean(KEY_LIVE_TYPING, liveTyping).apply()
+            // 识别方式没换就不重写（没选过的人一直跟着默认走）；applyVoiceSettings 把设置交给全屏的语音按钮（focusedVoice）
+            if (choice != (chosenModel()?.name ?: ASR_SYSTEM)) chooseAsr(choice) else applyVoiceSettings()
+        }
+
+        override fun releaseEverything(): Boolean = releaseEverywhere()
+
+        override fun pictureBottom(): Int = portraitPictureHeight() ?: 0
+
+        // 横屏时画面占满整个屏幕（全屏的画面贴在左上角），画面控件里的坐标就是工作台的坐标
+        override fun pictureRight(): Int = if (root.width > root.height) screen.fitPictureRight() else 0
+    }
+
+    /**
+     * 让电脑把按着的全松开：{"t":"release"}，电脑在哪条连接上都认（局域网、蓝牙都行，link.rs 里是 release_everything：
+     * 直通按着的键、修饰键、鼠标键、切换应用按着的 Alt 全松开）。修饰键、画面上按住的左键、切换应用只能走局域网松开，
+     * 局域网断了就靠它（v3.2 K7）。一条连接都没有：记下来，连上了马上补发（applyStatus）。返回 true = 发出去了
+     */
+    private fun releaseEverywhere(): Boolean {
+        val sent = link?.send(JSONObject().put("t", "release")) == true
+        releasePending = !sent
+        return sent
+    }
+
+    /** 电脑上可能还按着东西、可是一条连接都没有：连上了先补发一条「全部松开」 */
+    private var releasePending = false
+
+    /** 画面（screenPointer）上的左键按下已经发到电脑、还没发抬起 */
+    private var remoteDown = false
+
+    /**
+     * 电脑屏幕模块上的鼠标：按下、移动、抬起只走局域网。按下发出去了才记着「电脑上左键按着」；
+     * 抬起发不出去（局域网断了）不能就这么算了，改发「全部松开」，不然电脑上左键一直按着，动一下鼠标就是在拖（审查 #1）
+     */
+    private fun remotePointer(action: ScreenView.PointerAction, x: Int, y: Int) {
+        val sent = status.lan && link?.send(JSONObject().put("t", "screenPointer")
+            .put("a", action.name.lowercase()).put("x", x).put("y", y)) == true
+        when (action) {
+            ScreenView.PointerAction.DOWN -> if (sent) remoteDown = true
+            ScreenView.PointerAction.UP -> {
+                if (remoteDown && !sent) releaseEverywhere()
+                remoteDown = false
+                // 点完一下：「只带一次」的 Ctrl / Shift 用掉了
+                focusedControls?.onRemoteInput()
+            }
+            ScreenView.PointerAction.MOVE -> Unit
+        }
+    }
+
+    /**
+     * 局域网断了（蓝牙可能还连着）：修饰键、画面上按住的左键、切换应用按着的 Alt 都只能走局域网松开，已经发不出去了。
+     * 手机这边先都变回「松开」，再发一条「全部松开」（走蓝牙；一条连接都没有就等连上再发）。真有按着的才说一声
+     */
+    private fun onLanLost() {
+        val held = remoteDown
+        remoteDown = false // 下面的「全部松开」连左键一起松了，画面那边收尾时不用再补
+        val busy = focusedControls?.dropHeldState() == true
+        if (!held && !busy) return
+        say(if (releaseEverywhere()) "局域网断了：已经让电脑松开按着的键"
+            else "局域网断了：连上电脑后马上让它松开按着的键")
+    }
+
+    /**
+     * 电脑说它把按着的全松开了（keysReleased：改配置、暂停、换方案、看门狗、局域网断开……，v3.2 K4）：
+     * 手机这边跟着变回「松开」，不再发松开；还没补发的「全部松开」也不用发了
+     */
+    private fun onKeysReleased() {
+        releasePending = false
+        remoteDown = false
+        focusedControls?.onKeysReleased()
+        val screens = (0 until grid.childCount).map { grid.getChildAt(it) }.filterIsInstance<ScreenView>() + listOfNotNull(focusedScreen)
+        screens.forEach { it.forgetRemoteHold() }
+    }
+
+    /** 全屏竖屏（没开「铺满屏幕」、知道桌面尺寸）时画面的高：贴在最上面，正好一个画面高。别的情况 null（占满整屏） */
+    private fun portraitPictureHeight(): Int? {
+        val screen = focusedScreen ?: return null
+        val (w, h) = screen.desktopSize()
+        val portrait = root.height > root.width
+        val fill = screen.getDisplayMode() == ScreenCoordinates.DisplayMode.COVER
+        if (!portrait || fill || w <= 0 || h <= 0) return null
+        return (root.width.toLong() * h / w).toInt().coerceIn(1, root.height)
+    }
+
+    /** 全屏竖屏：画面贴在最上面、高度正好（下面的空白放语音条、键鼠条）；横屏铺满整个屏幕 */
+    /** 全屏时根布局尺寸变了（转屏、系统栏出没）：按新尺寸重新算竖屏画面的高度 */
+    private val focusLayoutListener = View.OnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+        if (r - l != or - ol || b - t != ob - ot) fitFocusedScreen()
+    }
+
+    private fun fitFocusedScreen() {
+        val screen = focusedScreen ?: return
+        root.post {
+            if (focusedScreen !== screen) return@post
+            val lp = screen.layoutParams as? FrameLayout.LayoutParams ?: return@post
+            // 「铺满屏幕」开着时竖屏也占满整屏（裁掉两边），关着时正好一个画面高
+            val target = portraitPictureHeight() ?: MATCH_PARENT
+            if (lp.height != target || lp.gravity != Gravity.TOP) {
+                lp.height = target
+                lp.gravity = Gravity.TOP
+                screen.layoutParams = lp
+            }
+            // 画面高了、矮了：竖屏的侧栏跟着放到画面下面
+            focusedControls?.onPictureChanged()
+        }
+    }
+
+    private fun updateRemoteSystemBars(fullscreen: Boolean) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.insetsController?.let {
+                if (fullscreen) {
+                    it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    it.hide(WindowInsets.Type.systemBars())
+                } else {
+                    it.show(WindowInsets.Type.systemBars())
+                }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = if (fullscreen) {
+                View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            } else 0
+        }
+    }
+
+    private fun toggleScreenOrientation() {
+        if (focusedScreen == null) return
+        // 锁定方向：锁住手机现在的方向（竖屏、横屏都行）；再点一下跟着手机转
+        focusRotationMode = if (focusRotationMode == 0) 1 else 0
+        @Suppress("DEPRECATION")
+        val rotation = windowManager.defaultDisplay.rotation
+        requestedOrientation = if (focusRotationMode == 1)
+            RemoteOrientationPolicy.lockCurrent(rotation)
+        else ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        say(if (focusRotationMode == 1) "已锁定现在的方向" else "方向已解锁，跟着手机转")
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // 保持同一屏幕视频会话和原版语音实例，方向变化仅刷新尺寸与系统栏。
+        root.requestApplyInsets()
+        focusedScreen?.requestLayout()
+        focusedControls?.bringToFront()
+        if (focusedControls != null) overlayHost.bringToFront() // 提示还是在最上面
+        focusedControls?.requestLayout()
+        Log.i("SuanNIAO-workbench", "configuration: orientation=${newConfig.orientation}; focus=${focusedScreen != null}")
+        if (focusedScreen != null) updateRemoteSystemBars(true)
+    }
+
+    private fun closeScreenFocus() {
+        val screen = focusedScreen ?: return
+        focusedScreen = null
+        focusedControls?.let { root.removeView(it); it.release() }
+        focusedControls = null
+        focusedVoice?.stopListening()
+        focusedVoice?.release()
+        focusedVoice = null
+        screen.cancelRemoteGesture()
+        screen.onQuickActionsRequested = null
+        screen.onAppSwitchRequested = null
+        screen.onSelectionHint = null
+        screen.onDesktopSizeChanged = null
+        overlays.noticePassThrough = false
+        root.removeOnLayoutChangeListener(focusLayoutListener)
+        screen.layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+        root.removeView(screen)
+        val cell = focusedScreenCell
+        if (cell != null) grid.add(screen, focusedScreenId, cell)
+        focusedScreenCell = null
+        focusedScreenId = ""
+        screen.setExpanded(false)
+        grid.requestLayout()
+        updateRemoteSystemBars(false)
+        focusLandscape = false
+        focusRotationMode = 0
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        if (deferredFocusConfig) {
+            deferredFocusConfig = false
+            applyConfig(force = true)
+        }
+    }
+
     private fun buildShell(): View {
         root = FrameLayout(this).apply { setBackgroundColor(palette.bg) }
         content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val overlayHost = FrameLayout(this)
+        overlayHost = FrameLayout(this)
         root.addView(content, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         root.addView(overlayHost, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         overlays = Overlays(overlayHost)
@@ -1084,8 +1506,12 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         val layout = withPendingLayout(config.optJSONObject("layout") ?: JSONObject(DEFAULT_CONFIG).getJSONObject("layout"))
         val pages = layout.optJSONArray("pages") ?: return
         if (pages.length() == 0) return
-        pageIndex = pageIndex.coerceIn(0, pages.length() - 1)
-        buildTabs(pages)
+        // 工作台专用页（"workbench": true）不在这里显示：用户会把它当多出来的一页删掉，工作台的热键就跟着没了（K1）
+        val shown = LayoutPages.visible(pages)
+        pageIndex = LayoutPages.resolve(pages, shown, pageId, pageIndex)
+        val page = shown.getOrNull(pageIndex)?.let { pages.getJSONObject(it) } ?: JSONObject()
+        if (shown.isNotEmpty()) rememberPage(page.optString("id"))
+        buildTabs(pages, shown)
 
         val touchpad = config.optJSONObject("touchpad") ?: JSONObject()
         val voice = config.optJSONObject("voice") ?: JSONObject()
@@ -1104,12 +1530,12 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         }
         updateProfile(config.optJSONObject("profile"))
 
+        closeScreenFocus()
         releaseKeys()
         grid.removeAllViews() // 触控板、语音在 reusable 里留着，下面会重新加回来
         grid.columns = layout.optInt("columns", 4)
         grid.rows = layout.optInt("rows", 8)
 
-        val page = pages.getJSONObject(pageIndex)
         val modules = page.optJSONArray("modules") ?: JSONArray()
         val onPage = mutableSetOf<String>()
         for (i in 0 until modules.length()) {
@@ -1131,10 +1557,33 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
                     box.delayMs = voice.optLong("delayMs", 1000)
                 }
                 "voiceButton" -> (reusable[id] as? VoiceButton ?: newVoiceButton(label)).also { it.label = label.ifBlank { "语音按钮" } }
+                "screen" -> (reusable[id] as? ScreenView ?: ScreenView(this)).also { screen ->
+                    screen.onExpandRequested = { toggleScreenFocus(screen) }
+                    screen.onRemotePointer = { action, x, y -> remotePointer(action, x, y) }
+                    screen.onRemoteRightClick = {
+                        if (status.lan) link?.send(JSONObject().put("t", "mouse").put("b", "right").put("a", "click"))
+                        focusedControls?.onRemoteInput()
+                    }
+                    screen.onRemoteScroll = { direction ->
+                        if (status.lan) link?.send(JSONObject().put("t", "scroll").put("x", 0).put("y", direction * 120))
+                    }
+                    screen.onMouseHoldChanged = { focusedControls?.setMouseHeld(it) }
+                    // A TextureView surface is recreated when the screen module moves
+                    // from the grid into fullscreen. Release the old video decoder
+                    // and subscribe again once the new surface is ready.
+                    screen.onSurfaceDestroyed = {
+                        main.removeCallbacks(delayedScreenStart)
+                        screenStream.stop()
+                    }
+                    screen.onSurfaceAvailable = {
+                        main.removeCallbacks(delayedScreenStart)
+                        main.postDelayed(delayedScreenStart, 650)
+                    }
+                }
                 else -> newKey(m, id, label.ifBlank { "?" }, doubleMs, longMs, repeatDelayMs, repeatIntervalMs, longRepeatDelayMs, longRepeatIntervalMs, paused)
             }
             (view.parent as? ViewGroup)?.removeView(view)
-            if (view is TouchpadView || view is VoiceBox || view is VoiceButton) {
+            if (view is TouchpadView || view is VoiceBox || view is VoiceButton || view is ScreenView) {
                 reusable[id] = view
                 onPage += id
             }
@@ -1150,34 +1599,43 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         reusable.keys.retainAll(everywhere)
         reusable.filterKeys { it !in onPage }.values.forEach { (it as? VoiceButton)?.stopListening() }
         grid.requestLayout()
+        updateScreenStream()
 
         // 入场动画：每页第一次显示时播；同一页布局变了（电脑上改了）也播；切回看过的页只淡入一下
-        val pageId = page.optString("id", pageIndex.toString())
-        val signature = layoutSignature(layout)
-        val firstTime = seenPages.add(pageId)
-        val samePage = pageId == shownPageId
+        val shownId = page.optString("id", pageIndex.toString())
+        val signature = layoutSignature(layout, page)
+        val firstTime = seenPages.add(shownId)
+        val samePage = shownId == shownPageId
         if (animate && (firstTime || (samePage && signature != shownSignature))) {
             grid.animateIn()
         } else if (!samePage) {
             grid.alpha = 0.4f
             grid.animate().alpha(1f).setDuration(160).setInterpolator(Ui.EASE).start()
         }
-        shownPageId = pageId
+        shownPageId = shownId
         shownSignature = signature
         applyVoiceSettings()
         updateOfflineLook()
         maybeShowGestureGuide()
     }
 
-    private fun buildTabs(pages: JSONArray) {
+    /** 记下现在看的是哪页：下标（看得见的页里第几个）和 id 一起存，专用页插进来、挪了位置也找得回来 */
+    private fun rememberPage(id: String) {
+        if (id == pageId && prefs.getInt(KEY_PAGE, -1) == pageIndex) return
+        pageId = id
+        prefs.edit().putInt(KEY_PAGE, pageIndex).putString(KEY_PAGE_ID, id).apply()
+    }
+
+    /** 页面标签：只有看得见的页（shown 是它们在 pages 里的下标），标签的第 i 个 = 看得见的第 i 页 */
+    private fun buildTabs(pages: JSONArray, shown: List<Int>) {
         val sig = StringBuilder().append(pageIndex)
-        for (i in 0 until pages.length()) sig.append('|').append(pages.getJSONObject(i).optString("name"))
-        if (sig.toString() == tabsSignature && tabs.childCount == pages.length()) return
+        for (at in shown) pages.getJSONObject(at).let { sig.append('|').append(it.optString("id")).append(':').append(it.optString("name")) }
+        if (sig.toString() == tabsSignature && tabs.childCount == shown.size) return
         tabsSignature = sig.toString()
         tabs.removeAllViews()
-        tabScroller.visibility = if (pages.length() > 1) View.VISIBLE else View.GONE
-        for (i in 0 until pages.length()) {
-            val page = pages.getJSONObject(i)
+        tabScroller.visibility = if (shown.size > 1) View.VISIBLE else View.GONE
+        shown.forEachIndexed { i, at ->
+            val page = pages.getJSONObject(at)
             val selected = i == pageIndex
             tabs.addView(TextView(this).apply {
                 text = page.optString("name", "第 ${i + 1} 页")
@@ -1192,7 +1650,7 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
                 setOnClickListener {
                     if (editor != null || i == pageIndex) return@setOnClickListener // 调整布局时不换页
                     pageIndex = i
-                    prefs.edit().putInt(KEY_PAGE, i).apply()
+                    rememberPage(page.optString("id"))
                     applyConfig(force = true)
                 }
             }, LinearLayout.LayoutParams(WRAP_CONTENT, dp(30)).apply { marginEnd = dp(6) })
@@ -1206,6 +1664,17 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         val t = m.optJSONObject("triggers") ?: JSONObject()
         // 按住时怎么办：电脑 0.4.0 起发 hold；更早的只有 repeat（连发）
         val hold = m.optString("hold").ifEmpty { if (m.optBoolean("repeat")) KeyButton.HOLD_REPEAT_CLICK else KeyButton.HOLD_LONG }
+        // 电脑上标了「按之前先确认」（比如 Alt+F4）：单击先问一句，跟全屏工作台里一样；双击、长按、连发照旧
+        val confirm = m.optBoolean("confirm")
+        fun send(buttonId: String, trigger: String, seq: Int, heldMs: Long): Boolean {
+            val msg = JSONObject().put("t", "button").put("id", buttonId).put("trigger", trigger)
+            // 连发、重复长按：第几下、手机上的时刻（电脑跟不上时据此跳过过时的几下）、按住多久了（光标加速用）
+            if (seq >= 0) msg.put("seq", seq).put("ts", SystemClock.uptimeMillis())
+            if (heldMs >= 0) msg.put("held", heldMs)
+            val sent = link?.send(msg) == true
+            if (sent) echo(label, trigger, seq)
+            return sent
+        }
         return KeyButton(
             this, id, label,
             hasDoubleClick = t.optBoolean("doubleClick"),
@@ -1219,13 +1688,16 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
             longRepeatIntervalMs = longRepeatIntervalMs,
             paused = paused,
             onTrigger = { buttonId, trigger, seq, heldMs ->
-                val msg = JSONObject().put("t", "button").put("id", buttonId).put("trigger", trigger)
-                // 连发、重复长按：第几下、手机上的时刻（电脑跟不上时据此跳过过时的几下）、按住多久了（光标加速用）
-                if (seq >= 0) msg.put("seq", seq).put("ts", SystemClock.uptimeMillis())
-                if (heldMs >= 0) msg.put("held", heldMs)
-                val sent = link?.send(msg) == true
-                if (sent) echo(label, trigger, seq)
-                sent
+                if (confirm && trigger == "click" && seq < 0) {
+                    overlays.dialog(HotkeyDialogs.confirmTitle(label), HotkeyDialogs.CONFIRM_MESSAGE, listOf(
+                        Btn("取消"),
+                        Btn("发送", Style.PRIMARY) {
+                            // 问的时候断线了：跟按键本身没发出去一样说一声
+                            if (!send(buttonId, trigger, seq, heldMs)) flash("未连接电脑 · 没有发送", 2200)
+                        },
+                    ))
+                    true // 弹了确认框，不算没发出去（按键不抖）
+                } else send(buttonId, trigger, seq, heldMs)
             },
             onHold = { buttonId, down ->
                 val sent = link?.send(JSONObject().put("t", "hold").put("id", buttonId).put("down", down)) == true
@@ -1259,9 +1731,10 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
     )
 
     /** 只看这一页模块的位置、大小、名字：换方案（只改了按法、按住时）不重播入场动画 */
-    private fun layoutSignature(layout: JSONObject): String {
-        val sb = StringBuilder().append(pageIndex).append(':').append(layout.optInt("columns")).append('x').append(layout.optInt("rows"))
-        val modules = layout.optJSONArray("pages")?.optJSONObject(pageIndex)?.optJSONArray("modules") ?: return sb.toString()
+    private fun layoutSignature(layout: JSONObject, page: JSONObject): String {
+        val sb = StringBuilder().append(pageIndex).append(':').append(page.optString("id")).append(':')
+            .append(layout.optInt("columns")).append('x').append(layout.optInt("rows"))
+        val modules = page.optJSONArray("modules") ?: return sb.toString()
         for (i in 0 until modules.length()) {
             val m = modules.getJSONObject(i)
             sb.append('|').append(m.optString("id")).append(',').append(m.optString("kind")).append(',').append(m.optString("label"))
@@ -1326,6 +1799,11 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         val wasKnown = statusKnown
         status = s
         statusKnown = true
+        // 先处理局域网断了：下面 updateScreenStream 收起画面时会松开左键，那时已经知道发不出去了
+        if (was.lan && !s.lan) onLanLost()
+        // 断线时电脑上可能还按着、一条连接都没有：连上了先补发「全部松开」
+        if (s.connected && releasePending) releaseEverywhere()
+        updateScreenStream()
         // 记下电脑的名字（旧版没存过，菜单里不然只能显示蓝牙地址）
         val switched = switching
         if (s.connected && !was.connected) {
@@ -1857,6 +2335,8 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
     override fun canShowUpdate(manual: Boolean): Boolean {
         if (!resumed || editor != null || overlays.isOpen || setup.onboardingOpen || anyVoiceBusy()) return false
         if (manual) return true
+        // 全屏远程画面上不自己弹（提示层盖在画面上面，会挡住正在操作的电脑）：回到主页再弹
+        if (focusedScreen != null) return false
         // 第一次打开、引导教程还没走：先不弹
         if (savedAddress() == null && !setup.tutorialSeen) return false
         // 手在屏幕上、刚碰过：等手离开一会儿，别挡住正在用的触控板、按键
@@ -1970,7 +2450,10 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
     private fun startEditing() {
         if (editor != null) return
         val layout = config.optJSONObject("layout") ?: return
-        editPageId = layout.optJSONArray("pages")?.optJSONObject(pageIndex)?.optString("id") ?: return
+        val pages = layout.optJSONArray("pages") ?: return
+        // 调的是现在看着的这页：pageIndex 只数看得见的页（工作台专用页不显示，也不在这里调，K1）
+        editPageId = LayoutPages.visible(pages).getOrNull(pageIndex)?.let { pages.optJSONObject(it)?.optString("id") }
+            ?: return say("没有能调整的页：先在电脑上的「布局」里加一页")
         // 正在说的话先收尾，按着的键松开，输入框收起键盘
         stopAllVoice()
         releaseKeys()
@@ -2136,6 +2619,8 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         when {
             overlays.back() -> {}
             editor != null -> if (editor?.changed() == true) confirmDiscardEditing() else cancelEditing()
+            // 全屏工作台在调整布局：先问「不保存了？」，不直接退出全屏把草稿扔掉（小米从边上一划也是返回，审查 #4）
+            focusedScreen != null -> if (focusedControls?.onBack() != true) closeScreenFocus()
             else -> moveTaskToBack(true)
         }
     }
@@ -2157,7 +2642,7 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
 
     /** 把识别设置交给语音按钮；用本地模型就提前在后台加载好 */
     private fun applyVoiceSettings() {
-        val buttons = reusable.values.filterIsInstance<VoiceButton>()
+        val buttons = reusable.values.filterIsInstance<VoiceButton>() + listOfNotNull(focusedVoice)
         if (buttons.isEmpty()) return
         val model = chosenModel()
         val live = prefs.getBoolean(KEY_LIVE_TYPING, true)
@@ -2168,10 +2653,11 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
         if (model != null) LocalAsr.preload(model) else LocalAsr.unload()
     }
 
-    private fun anyVoiceBusy() = reusable.values.any { (it as? VoiceButton)?.isBusy() == true }
+    private fun anyVoiceBusy() = reusable.values.any { (it as? VoiceButton)?.isBusy() == true } || focusedVoice?.isBusy() == true
 
     private fun stopAllVoice() {
         reusable.values.forEach { (it as? VoiceButton)?.stopListening() }
+        focusedVoice?.stopListening()
     }
 
     /** 锁定录音时顶栏常驻「录音中 · 点此结束」 */
@@ -2219,9 +2705,12 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
 
     // ───────── 提示 ─────────
 
-    /** 提示：顶栏放得下就在顶栏闪 4 秒；放不下就换成顶栏下面的卡片（不截断，也不两处同时说） */
+    /**
+     * 提示：顶栏放得下就在顶栏闪 4 秒；放不下就换成顶栏下面的卡片（不截断，也不两处同时说）。
+     * 全屏工作台时顶栏被画面盖着，一律用卡片。
+     */
     private fun say(text: String) {
-        if (editor == null && readout.fits(text)) flash(text, 4000) else overlays.notice(text)
+        if (editor == null && focusedScreen == null && readout.fits(text)) flash(text, 4000) else overlays.notice(text)
     }
 
     /** 顶栏右边临时换成 text，ms 毫秒后回到连接状态；太长就改用卡片 */
@@ -2342,7 +2831,12 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
                 onConfig(msg)
                 offerClipboard() // 刚连上（配置里才知道开没开同步）：在前台的话把手机上新复制的发过去
             }
+            "lan" -> updateScreenStream()
+            "keysReleased" -> onKeysReleased()
             "layoutSaved" -> onLayoutSaved(msg)
+            "keyEditorSaved" -> focusedControls?.onKeyEditorSaved(msg)
+            "screenWorkbenchV3Saved" -> focusedControls?.onSaveResult(
+                msg.optString("requestId"), msg.optBoolean("ok"), msg.optString("error"))
             // 按键里的「切换方案」切了方案：屏幕中间浮出新方案名
             "profile" -> spotlightProfile(profileTitle(msg.optString("to")))
             // 电脑上复制了图片：蓝牙上要传一会儿，传完才能粘贴
@@ -2383,6 +2877,13 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
             return
         }
         config = msg
+        if (focusedScreen != null) {
+            // 全屏操作时只更新快捷条，延后重建网格，避免频繁配置推送中断视频/语音。
+            deferredFocusConfig = true
+            focusedControls?.updateConfig(config)
+            link?.ackConfig(msg)
+            return
+        }
         applyConfig()
         link?.ackConfig(msg)
     }
@@ -2533,7 +3034,10 @@ class MainActivity : Activity(), LinkService.Listener, TouchpadView.Sink, Setup.
     }
 
     companion object {
+        /** 看的是第几页（看得见的页里第几个；旧版是算上工作台专用页的下标） */
         private const val KEY_PAGE = "page_index"
+        /** 看的那一页的 id（新版才有）：工作台专用页插到前面、页挪了位置也找得回来 */
+        private const val KEY_PAGE_ID = "page_id"
         /** 语音识别用哪个：本地模型的目录名，或 ASR_SYSTEM */
         private const val KEY_ASR = "asr_engine"
         private const val ASR_SYSTEM = "system"

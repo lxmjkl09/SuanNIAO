@@ -459,21 +459,35 @@ class Overlays(private val host: FrameLayout) {
 
     private var noticeView: View? = null
     private var noticeHide: Runnable? = null
+    /** 现在这张卡片是不是在底部（收起时往下淡出） */
+    private var noticeAtBottom = false
+
+    /**
+     * 全屏远程工作台时 MainActivity 设成 true：卡片改到底部中间、窄一点，而且不接手指（点下去落到下面的按钮、电脑画面上）。
+     * 以前它在最上层、整行宽、能点，几秒钟里会吃掉悬浮球、切换应用面板、电脑画面顶上的点击（审查 #2）。卡片上的按钮照样能点
+     */
+    var noticePassThrough = false
 
     /** 顶栏下面滑出一张黑色卡片（顶掉上一张）；可以带一个按钮。ms = 0 按字数定显示多久 */
     fun notice(message: CharSequence, action: String? = null, ms: Long = 0, onAction: (() -> Unit)? = null) {
         hideNotice(fast = true)
+        val pass = noticePassThrough
         val card = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = Ui.round(palette.fg, dpf(16f))
+            background = Ui.round(if (pass) Ui.alpha(palette.fg, .9f) else palette.fg, dpf(16f))
             setPadding(dp(16f), dp(12f), dp(if (action != null) 8f else 16f), dp(12f))
             addView(text("", 13.5f, 750, palette.tile).apply {
                 text = message
                 maxLines = 5
                 ellipsize = TextUtils.TruncateAt.END
                 setLineSpacing(dpf(2f), 1f)
-            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                if (pass) {
+                    // 窄卡片按字数变宽，最宽 420dp，也不超出屏幕
+                    val screen = host.width.takeIf { it > 0 } ?: context.resources.displayMetrics.widthPixels
+                    maxWidth = min(dp(420f), screen - dp(24f + 32f) - if (action != null) dp(90f) else 0)
+                }
+            }, if (pass) LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT) else LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             if (action != null) {
                 addView(text(action, 13.5f, 900, palette.fg).apply {
                     gravity = Gravity.CENTER
@@ -486,14 +500,22 @@ class Overlays(private val host: FrameLayout) {
                     }
                 }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = dp(10f) })
             }
-            setOnClickListener { hideNotice(fast = false) }
+            // 不接手指时不设点击：没有点击的 View 不拦触摸，手指落到下面
+            if (!pass) setOnClickListener { hideNotice(fast = false) }
         }
-        host.addView(card, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.TOP).apply {
-            setMargins(dp(12f), noticeTop, dp(12f), 0)
+        host.addView(card, if (pass) {
+            FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+                setMargins(dp(12f), 0, dp(12f), insetBottom + dp(18f))
+            }
+        } else {
+            FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.TOP).apply {
+                setMargins(dp(12f), noticeTop, dp(12f), 0)
+            }
         })
         noticeView = card
+        noticeAtBottom = pass
         card.alpha = 0f
-        card.translationY = -dpf(10f)
+        card.translationY = if (pass) dpf(10f) else -dpf(10f)
         card.animate().alpha(1f).translationY(0f).setDuration(220).setInterpolator(Ui.EASE).start()
         val shown = if (ms > 0) ms else (2400L + message.length * 70L).coerceAtMost(6500L)
         val hide = Runnable { hideNotice(fast = false) }
@@ -506,7 +528,8 @@ class Overlays(private val host: FrameLayout) {
         noticeHide = null
         val old = noticeView ?: return
         noticeView = null
-        old.animate().alpha(0f).translationY(if (fast) 0f else -dpf(8f)).setDuration(if (fast) 100 else 180)
+        val away = if (noticeAtBottom) dpf(8f) else -dpf(8f)
+        old.animate().alpha(0f).translationY(if (fast) 0f else away).setDuration(if (fast) 100 else 180)
             .setInterpolator(Ui.EASE).withEndAction { host.removeView(old) }.start()
     }
 

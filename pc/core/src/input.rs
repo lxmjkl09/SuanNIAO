@@ -167,6 +167,16 @@ pub fn motion_wait() -> f64 {
 }
 
 /// 立即移动指针（按键映射里的"光标移动"用，不走平滑）。
+/// 画面触摸使用主显示器物理像素，不经过触控板的相对位移回放。
+pub fn move_absolute(x: i32, y: i32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let (width, height) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    if x < 0 || y < 0 || x >= width || y >= height { return false; }
+    flush_motion();
+    if !crate::trace::dry_run() { let _ = unsafe { SetCursorPos(x, y) }; }
+    true
+}
+
 pub fn move_now(dx: f64, dy: f64) {
     flush_motion();
     apply_move(dx, dy);
@@ -381,6 +391,43 @@ pub fn release_keys_all() {
     send(&ups);
 }
 
+/// 手机键鼠条上按住的修饰键：键码 → 按下时的直通代数（全部松开过一次，旧代数作废，见 release_keys）
+static MOD_HOLDS: LazyLock<Mutex<HashMap<u16, u64>>> = LazyLock::new(Default::default);
+
+/// 只认这四个名字（跟 key 消息里修饰键的写法一样）
+pub fn modifier_vk(name: &str) -> Option<u16> {
+    match name {
+        "ctrl" | "shift" | "alt" | "win" => suanniao_config::key_code(name),
+        _ => None,
+    }
+}
+
+/// 修饰键按下（一直按着）或松开。重复按下不会按两次。不认识的名字返回 false。
+pub fn modifier(name: &str, down: bool) -> bool {
+    let Some(vk) = modifier_vk(name) else { return false };
+    let mut holds = MOD_HOLDS.lock().unwrap();
+    if down {
+        if holds.get(&vk).is_some_and(|g| *g == hold_generation()) {
+            return true;
+        }
+        let generation = hold_keys(&[vk]);
+        holds.insert(vk, generation);
+    } else if let Some(generation) = holds.remove(&vk) {
+        release_keys(&[vk], generation);
+    }
+    true
+}
+
+/// 松开键鼠条上按住的所有修饰键（mod 只从局域网来：局域网断了、蓝牙还连着时也要松，见 link）。返回松开了几个。
+/// 同一个键还被直通的按键按着的话，按引用计数只减一，不会把那边的也抬起来
+pub fn release_modifier_holds() -> usize {
+    let holds: Vec<(u16, u64)> = MOD_HOLDS.lock().unwrap().drain().collect();
+    for (vk, generation) in &holds {
+        release_keys(&[*vk], *generation);
+    }
+    holds.len()
+}
+
 /// 按着的非修饰键：400 ms 后每 80 ms 补发一次按下（Windows 不会替注入的按键自动连发）
 fn repeat_loop() {
     let mut keys = KEYS.lock().unwrap();
@@ -427,5 +474,20 @@ pub fn paste_text(text: &str) {
     });
     if !pasted {
         type_text(text);
+    }
+}
+
+#[cfg(test)]
+mod modifier_tests {
+    use super::modifier_vk;
+
+    #[test]
+    fn modifier_names_map_to_virtual_keys() {
+        assert_eq!(modifier_vk("ctrl"), Some(0xA2));
+        assert_eq!(modifier_vk("shift"), Some(0xA0));
+        assert_eq!(modifier_vk("alt"), Some(0xA4));
+        assert_eq!(modifier_vk("win"), Some(0x5B));
+        assert_eq!(modifier_vk("a"), None);
+        assert_eq!(modifier_vk("ctrl+a"), None);
     }
 }
